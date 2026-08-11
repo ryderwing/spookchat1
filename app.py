@@ -72,6 +72,45 @@ create table if not exists server_members(
 
 
 
+
+create table if not exists site_settings(
+ id integer primary key default 1,
+ maintenance_mode boolean not null default false,
+ maintenance_message text not null default 'SpookChat is temporarily under maintenance.',
+ registrations_enabled boolean not null default true,
+ site_name text not null default 'SpookChat',
+ announcement text not null default '',
+ updated_at timestamptz not null default now()
+);
+
+insert into site_settings(id) values(1) on conflict(id) do nothing;
+
+create table if not exists site_roles(
+ id bigserial primary key,
+ name text not null unique,
+ permissions jsonb not null default '{}'::jsonb,
+ created_at timestamptz not null default now()
+);
+
+create table if not exists user_site_roles(
+ user_id bigint not null references users(id) on delete cascade,
+ role_id bigint not null references site_roles(id) on delete cascade,
+ primary key(user_id,role_id)
+);
+
+create table if not exists owner_audit_log(
+ id bigserial primary key,
+ actor_id bigint references users(id) on delete set null,
+ action text not null,
+ target_type text not null default '',
+ target_id text not null default '',
+ details text not null default '',
+ created_at timestamptz not null default now()
+);
+
+create index if not exists owner_audit_log_created_idx
+on owner_audit_log(created_at desc);
+
 create table if not exists server_join_requests(
  id bigserial primary key,
  server_id bigint not null references servers(id) on delete cascade,
@@ -100,6 +139,7 @@ create table if not exists server_roles(
  id bigserial primary key,
  server_id bigint not null references servers(id) on delete cascade,
  name text not null,
+ permissions jsonb not null default '{}'::jsonb,
  created_at timestamptz not null default now(),
  unique(server_id,name)
 );
@@ -121,6 +161,15 @@ create table if not exists server_channels(
  position integer not null default 0,
  created_at timestamptz not null default now(),
  unique(server_id,name)
+);
+
+
+create table if not exists channel_role_overrides(
+ channel_id bigint not null references server_channels(id) on delete cascade,
+ role_key text not null,
+ allow_permissions jsonb not null default '[]'::jsonb,
+ deny_permissions jsonb not null default '[]'::jsonb,
+ primary key(channel_id,role_key)
 );
 
 create table if not exists spookhooks(
@@ -256,6 +305,18 @@ def init_db():
             c.execute("alter table messages add column if not exists is_spookhook boolean not null default false")
             c.execute("alter table messages add column if not exists hook_name text not null default ''")
 
+            c.execute("alter table server_roles add column if not exists permissions jsonb not null default '{}'::jsonb")
+            c.execute("""
+                create table if not exists channel_role_overrides(
+                 channel_id bigint not null references server_channels(id) on delete cascade,
+                 role_key text not null,
+                 allow_permissions jsonb not null default '[]'::jsonb,
+                 deny_permissions jsonb not null default '[]'::jsonb,
+                 primary key(channel_id,role_key)
+                )
+            """)
+
+
             # Seed the two original server channels for old and new servers.
             c.execute("""
                 insert into server_channels(server_id,name,kind,view_roles,talk_roles,position)
@@ -317,6 +378,47 @@ def init_db():
             """)
             c.execute("create index if not exists server_invites_server_idx on server_invites(server_id,created_at)")
 
+            c.execute("""
+                create table if not exists site_settings(
+                 id integer primary key default 1,
+                 maintenance_mode boolean not null default false,
+                 maintenance_message text not null default 'SpookChat is temporarily under maintenance.',
+                 registrations_enabled boolean not null default true,
+                 site_name text not null default 'SpookChat',
+                 announcement text not null default '',
+                 updated_at timestamptz not null default now()
+                )
+            """)
+            c.execute("insert into site_settings(id) values(1) on conflict(id) do nothing")
+            c.execute("""
+                create table if not exists site_roles(
+                 id bigserial primary key,
+                 name text not null unique,
+                 permissions jsonb not null default '{}'::jsonb,
+                 created_at timestamptz not null default now()
+                )
+            """)
+            c.execute("""
+                create table if not exists user_site_roles(
+                 user_id bigint not null references users(id) on delete cascade,
+                 role_id bigint not null references site_roles(id) on delete cascade,
+                 primary key(user_id,role_id)
+                )
+            """)
+            c.execute("""
+                create table if not exists owner_audit_log(
+                 id bigserial primary key,
+                 actor_id bigint references users(id) on delete set null,
+                 action text not null,
+                 target_type text not null default '',
+                 target_id text not null default '',
+                 details text not null default '',
+                 created_at timestamptz not null default now()
+                )
+            """)
+            c.execute("create index if not exists owner_audit_log_created_idx on owner_audit_log(created_at desc)")
+
+
 
 
             c.commit()
@@ -371,6 +473,9 @@ def login_required(fn):
         if ip_is_banned(client_ip()):
             return jsonify(error="This IP address is banned from SpookChat."), 403
         u = current_user()
+        settings=get_site_settings()
+        if settings["maintenance_mode"] and (not u or u["global_role"]!="owner"):
+            return jsonify(error=settings["maintenance_message"],maintenance=True),503
         if not u:
             return jsonify(error="Not logged in"), 401
         if u["banned_until"] and u["banned_until"] > datetime.now(timezone.utc):
@@ -410,6 +515,117 @@ def server_level(role):
     return {"member":0, "moderator":1, "admin":2, "owner":3}.get(role, -1)
 
 
+
+SERVER_PERMISSION_KEYS = [
+    "administrator",
+    "view_channels",
+    "send_messages",
+    "invite_members",
+    "manage_channels",
+    "manage_roles",
+    "manage_members",
+    "mute_members",
+    "ban_members",
+    "manage_messages",
+    "manage_spookhooks",
+    "manage_server"
+]
+
+ALL_SERVER_PERMISSIONS_EXCEPT_DELETE = {
+    "view_channels","send_messages","invite_members","manage_channels","manage_roles",
+    "manage_members","mute_members","ban_members","manage_messages","manage_spookhooks","manage_server"
+}
+
+BUILTIN_SERVER_PERMISSIONS = {
+    "member": {"view_channels","send_messages"},
+    "moderator": {"view_channels","send_messages","manage_messages","mute_members"},
+    "admin": set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE),
+    "owner": set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE) | {"delete_server"}
+}
+
+def normalize_permissions(value):
+    if isinstance(value, dict):
+        return {k for k,v in value.items() if bool(v) and k in SERVER_PERMISSION_KEYS}
+    if isinstance(value, list):
+        return {str(x) for x in value if str(x) in SERVER_PERMISSION_KEYS}
+    return set()
+
+def member_role_keys(sid, uid):
+    sm = server_member(sid, uid)
+    if not sm:
+        return set()
+    keys = {sm["role"]}
+    with connect() as c:
+        rows = c.execute("""
+            select smr.role_id
+            from server_member_roles smr
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,uid)).fetchall()
+    keys |= {f"custom:{r[0]}" for r in rows}
+    return keys
+
+def server_permissions_for_user(sid, uid):
+    sm = server_member(sid, uid)
+    if not sm:
+        return set()
+    if sm["role"] == "owner":
+        return set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE) | {"delete_server"}
+
+    perms = set(BUILTIN_SERVER_PERMISSIONS.get(sm["role"], set()))
+    with connect() as c:
+        rows = c.execute("""
+            select sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,uid)).fetchall()
+
+    for r in rows:
+        rp = normalize_permissions(r[0])
+        if "administrator" in rp:
+            perms |= set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)
+        perms |= (rp - {"administrator"})
+    return perms
+
+def has_server_permission(sid, uid, permission):
+    return permission in server_permissions_for_user(sid, uid)
+
+def channel_permission(sid, channel_id, uid, permission):
+    sm = server_member(sid,uid)
+    if not sm:
+        return False
+    if sm["role"] == "owner":
+        return True
+
+    base = has_server_permission(sid,uid,permission)
+    role_keys = member_role_keys(sid,uid)
+
+    with connect() as c:
+        rows = c.execute("""
+            select role_key,allow_permissions,deny_permissions
+            from channel_role_overrides
+            where channel_id=%s
+        """,(channel_id,)).fetchall()
+
+    allowed = False
+    denied = False
+    for role_key,allow,deny in rows:
+        if role_key not in role_keys:
+            continue
+        allow_set = set(allow or [])
+        deny_set = set(deny or [])
+        if permission in deny_set:
+            denied = True
+        if permission in allow_set:
+            allowed = True
+
+    if denied:
+        return False
+    if allowed:
+        return True
+    return base
+
+
 def server_custom_roles(sid, uid):
     with connect() as c:
         rows = c.execute("""
@@ -419,21 +635,83 @@ def server_custom_roles(sid, uid):
     return {f"custom:{r[0]}" for r in rows}
 
 def channel_access(sid, channel_id, uid, mode):
-    sm = server_member(sid,uid)
-    if not sm:
-        return False
-    if sm["role"] == "owner":
-        return True
+    permission = "view_channels" if mode == "view" else "send_messages"
+    return channel_permission(sid, channel_id, uid, permission)
+
+
+
+SITE_ROLE_PERMISSION_KEYS = [
+    "view_moderation",
+    "manage_users",
+    "manage_reports",
+    "manage_ip_bans",
+    "manage_global_roles",
+    "manage_site_roles",
+    "view_audit_log"
+]
+
+def get_site_settings():
     with connect() as c:
-        r = c.execute("""
-            select view_roles,talk_roles from server_channels where id=%s and server_id=%s
-        """,(channel_id,sid)).fetchone()
+        r=c.execute("""
+            select maintenance_mode,maintenance_message,registrations_enabled,site_name,announcement
+            from site_settings where id=1
+        """).fetchone()
     if not r:
-        return False
-    allowed = set(r[0] if mode=="view" else r[1])
-    if sm["role"] in allowed:
-        return True
-    return bool(server_custom_roles(sid,uid) & allowed)
+        return {
+            "maintenance_mode":False,
+            "maintenance_message":"SpookChat is temporarily under maintenance.",
+            "registrations_enabled":True,
+            "site_name":"SpookChat",
+            "announcement":""
+        }
+    return {
+        "maintenance_mode":bool(r[0]),
+        "maintenance_message":r[1],
+        "registrations_enabled":bool(r[2]),
+        "site_name":r[3],
+        "announcement":r[4]
+    }
+
+def site_permissions_for_user(uid):
+    u=row_user(uid)
+    if not u:
+        return set()
+    if u["global_role"]=="owner":
+        return set(SITE_ROLE_PERMISSION_KEYS) | {"owner_control"}
+
+    perms=set()
+    if u["global_role"]=="moderator":
+        perms |= {"view_moderation","manage_reports"}
+    elif u["global_role"]=="admin":
+        perms |= {"view_moderation","manage_reports","manage_users","manage_ip_bans"}
+
+    with connect() as c:
+        rows=c.execute("""
+            select sr.permissions
+            from user_site_roles usr
+            join site_roles sr on sr.id=usr.role_id
+            where usr.user_id=%s
+        """,(uid,)).fetchall()
+    for r in rows:
+        raw=r[0] or {}
+        if isinstance(raw,dict):
+            perms |= {k for k,v in raw.items() if v and k in SITE_ROLE_PERMISSION_KEYS}
+    return perms
+
+def has_site_permission(uid,perm):
+    return perm in site_permissions_for_user(uid)
+
+def audit_owner_action(actor_id,action,target_type="",target_id="",details=""):
+    try:
+        with connect() as c:
+            c.execute("""
+                insert into owner_audit_log(actor_id,action,target_type,target_id,details)
+                values(%s,%s,%s,%s,%s)
+            """,(actor_id,action,str(target_type)[:80],str(target_id)[:120],str(details)[:500]))
+            c.commit()
+    except Exception as e:
+        print("AUDIT LOG ERROR:",repr(e))
+
 
 def global_level(role):
     return {"user":0, "moderator":1, "admin":2, "owner":3}.get(role, -1)
@@ -1245,10 +1523,88 @@ body {
   }
 }
 
+
+/* ============================================================
+   NATIVE-LIKE MOBILE UI
+   ============================================================ */
+@media(max-width:720px){
+  .mobilebar{
+    position:fixed!important;
+    left:0!important;right:0!important;bottom:0!important;
+    z-index:80!important;
+    height:68px!important;
+    padding:6px max(8px,env(safe-area-inset-right)) calc(6px + env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left))!important;
+    background:rgba(12,9,17,.96)!important;
+    backdrop-filter:blur(20px)!important;
+    border-top:1px solid rgba(255,255,255,.08)!important;
+    box-shadow:0 -12px 40px rgba(0,0,0,.35)!important;
+  }
+  .mobilebar button{
+    min-width:52px!important;
+    flex:1!important;
+    display:flex!important;
+    flex-direction:column!important;
+    align-items:center!important;
+    justify-content:center!important;
+    gap:2px!important;
+    border-radius:12px!important;
+    padding:4px 3px!important;
+    color:#91889c!important;
+    transition:.16s ease!important;
+  }
+  .mobilebar button b{font-size:18px!important;line-height:20px!important}
+  .mobilebar button span:not(.notifyBadge){font-size:10px!important;font-weight:700!important}
+  .mobilebar button.active{
+    color:#d8c2ff!important;
+    background:rgba(155,77,255,.11)!important;
+  }
+  .app{
+    height:calc(100dvh - 68px)!important;
+    max-height:calc(100dvh - 68px)!important;
+  }
+  .main{border-radius:0!important}
+  .topbar{
+    position:sticky!important;
+    top:0!important;
+    z-index:20!important;
+    padding:0 14px!important;
+  }
+  .topActions .ghost{padding:8px!important;font-size:0!important}
+  .topActions .ghost::first-letter{font-size:14px}
+  .page{padding:16px 14px 100px!important}
+  .pageHero{gap:10px!important}
+  .pageHero h1{font-size:24px!important}
+  .card{border-radius:15px!important;padding:14px!important}
+  .messages{padding:12px 10px 84px!important}
+  .msg{padding:9px 8px!important}
+  .composer{
+    position:sticky!important;
+    bottom:0!important;
+    z-index:25!important;
+    margin:0 8px 8px!important;
+    border-radius:15px!important;
+  }
+  .modalWrap{
+    align-items:flex-end!important;
+    padding:0!important;
+  }
+  .modal{
+    width:100%!important;
+    max-width:none!important;
+    max-height:88dvh!important;
+    border-radius:22px 22px 0 0!important;
+    padding:18px 16px calc(22px + env(safe-area-inset-bottom))!important;
+    animation:mobileSheetIn .18s ease!important;
+  }
+  @keyframes mobileSheetIn{from{transform:translateY(30px);opacity:.75}to{transform:none;opacity:1}}
+  .grid2{grid-template-columns:1fr!important}
+  .listItem{gap:9px!important}
+}
+
 </style>
 </head>
 <body>
-<div id="root"></div>
+<div id="siteBanner"></div><div id="root"></div>
 <div id="modal"></div>
 <div id="overlay"></div>
 <div id="toastWrap"></div>
@@ -1275,7 +1631,19 @@ function modalClose(){modal.innerHTML=""}
 function closeContext(){overlay.innerHTML=""}
 document.addEventListener("click",e=>{if(!e.target.closest(".context"))closeContext()});
 
+
+async function loadSiteStatus(){
+ try{
+   const s=await api("/api/site-status");
+   if(s.announcement){
+     siteBanner.innerHTML=`<div style="position:fixed;left:50%;transform:translateX(-50%);top:10px;z-index:300;background:#1a1224;border:1px solid #7144a0;color:#eee;padding:9px 14px;border-radius:12px;box-shadow:0 10px 40px #0008;max-width:min(700px,90vw);text-align:center">${esc(s.announcement)}</div>`;
+   }else siteBanner.innerHTML="";
+   return s;
+ }catch(e){return null}
+}
+
 async function boot(){
+ const siteStatus=await loadSiteStatus();
  try{
    const d=await api("/api/me");
    state.me=d.user;state.profile=d.profile;
@@ -1326,7 +1694,7 @@ function sidebar(){
    <button class="sideBtn ${state.view==="friends"?"active":""}" onclick="showFriendsPage()"><span class="iconBox">👥</span>Friends <span id="friendsUnreadSide" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>
    <button class="sideBtn" onclick="showNotifications()"><span class="iconBox">🔔</span>Notifications <span id="notificationsUnreadSide" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>
    <button class="sideBtn" onclick="groupCreate()"><span class="iconBox">＋</span>New Group</button>
-   ${isStaff?`<button class="sideBtn ${state.view==="staff"?"active":""}" onclick="showStaff()"><span class="iconBox">🛡</span>Moderation</button>`:""}
+   ${isStaff?`<button class="sideBtn ${state.view==="staff"?"active":""}" onclick="showStaff()"><span class="iconBox">🛡</span>Moderation</button>`:""}${state.profile.global_role==="owner"?`<button class="sideBtn ${state.view==="owner"?"active":""}" onclick="showOwnerPanel()"><span class="iconBox">👑</span>Owner Control</button>`:""}
    <button class="sideBtn ${state.view==="settings"?"active":""}" onclick="showSettings()"><span class="iconBox">⚙</span>SpookChat Settings</button>
    <a class="sideBtn" href="/static/downloads/SpookChatPCSet-up.exe" download="SpookChatPCSet-up.exe" style="text-decoration:none"><span class="iconBox">⬇</span>Download Desktop App</a>
    <button class="sideBtn ${state.view==="discover"?"active":""}" onclick="showServerDiscovery()"><span class="iconBox">🔎</span>Discover Servers</button>
@@ -1347,14 +1715,16 @@ function sidebar(){
 
 function mobilebar(){
  return `<nav class="mobilebar">
- <button onclick="openPublic('chat1')"><b>#</b>Chat</button>
- <button onclick="showFriendsPage()" style="position:relative"><b>👥</b>Friends<span id="friendsUnreadMobile" class="notifyBadge ${state.unreadCount?"":"hidden"}" style="position:absolute;top:0;right:2px">${state.unreadCount||""}</span></button>
- <button onclick="showNotifications()" style="position:relative"><b>🔔</b>Alerts<span id="notificationsUnreadMobile" class="notifyBadge ${state.unreadCount?"":"hidden"}" style="position:absolute;top:0;right:2px">${state.unreadCount||""}</span></button>
- <button onclick="showServersMobile()"><b>◈</b>Servers</button>
- <button onclick="showSettings()"><b>⚙</b>Settings</button>
+ <button class="${state.view==="public"?"active":""}" onclick="openPublic('chat1')"><b>💬</b><span>Chats</span></button>
+ <button class="${state.view==="friends"?"active":""}" onclick="showFriendsPage()" style="position:relative"><b>👥</b><span>Friends</span><span id="friendsUnreadMobile" class="notifyBadge ${state.unreadCount?"":"hidden"}" style="position:absolute;top:3px;right:5px">${state.unreadCount||""}</span></button>
+ <button class="${state.view==="discover"||state.view==="server"?"active":""}" onclick="showMobileServerSheet()"><b>◈</b><span>Servers</span></button>
+ <button onclick="showNotifications()" style="position:relative"><b>🔔</b><span>Alerts</span><span id="notificationsUnreadMobile" class="notifyBadge ${state.unreadCount?"":"hidden"}" style="position:absolute;top:3px;right:5px">${state.unreadCount||""}</span></button>
+ <button class="${state.view==="settings"?"active":""}" onclick="showSettings()"><b>⚙</b><span>Settings</span></button>
  </nav>`;
 }
-
+function showMobileServerSheet(){
+ modalOpen("Servers",`<div class="formGrid"><button class="primary" onclick="modalClose();showServerDiscovery()">Discover Servers</button><button class="ghost" onclick="modalClose();serverCreate()">Create Server</button>${state.servers.map(s=>`<button class="serverBtn" onclick="modalClose();openServer(${s.id})"><span class="serverIcon">${s.icon?`<img src="${esc(s.icon)}">`:esc(s.name[0])}</span><span class="listMain">${esc(s.name)}</span><span class="badge">${s.member_count}</span></button>`).join("")}</div>`);
+}
 
 function notificationBellButton(){
  return `<button class="roundBtn notificationBell" onclick="showNotifications()" title="Notifications">🔔<span class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>`;
@@ -1373,6 +1743,7 @@ function renderApp(){
  if(state.view==="friends")renderFriendsPage();
  else if(state.view==="settings")renderSettings();
  else if(state.view==="staff")renderStaff();
+ else if(state.view==="owner")renderOwnerPanel();
  else if(state.view==="discover")renderServerDiscovery();
  else if(state.view==="server")renderServer();
  else renderChat();
@@ -1552,10 +1923,10 @@ function renderServer(){
  clearInterval(state.poll);
  const s=state.serverInfo; if(!s){openPublic("chat1");return}
  appShell.classList.add("with-members");
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions">${notificationBellButton()}<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>${s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Server settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div></header>
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions">${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Server settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div></header>
  <div style="display:flex;min-height:0;flex:1">
    <div style="width:190px;border-right:1px solid var(--line);padding:12px;background:#0d0a12">
-     <div class="sectionTitle"><span>Channels</span>${s.my_role==="owner"?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
+     <div class="sectionTitle"><span>Channels</span>${hasServerPerm("manage_channels")?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
      ${state.serverChannels.map(c=>`<button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</button>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
    </div>
    <div style="min-width:0;flex:1;display:flex;flex-direction:column"><div class="content"><div id="messageList" class="messages"></div></div><div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message channel..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div></div>
@@ -1588,7 +1959,7 @@ async function showServerSettings(id){
    const s=state.serverInfo;
    modalOpen("Server settings",`<div class="formGrid"><div class="label">Server name</div><input id="serverSetName" class="field" value="${esc(s.name)}"><div class="label">Server picture URL</div><input id="serverSetIcon" class="field" value="${esc(s.icon||"")}"><div class="label">Server privacy</div><select id="serverPrivacyMode" class="field"><option value="public" ${s.privacy_mode==="public"?"selected":""}>Public — anyone can join</option><option value="public_approval" ${s.privacy_mode==="public_approval"?"selected":""}>Public + Owner Approval — join requests</option><option value="invite_only" ${s.privacy_mode==="invite_only"?"selected":""}>Invite Only — hidden from Discover</option><option value="private" ${s.privacy_mode==="private"?"selected":""}>Private — no joining</option></select><button class="primary" onclick="saveServerSettings(${id})">Save server settings</button></div>
    <div class="card" style="margin-top:16px"><h3>Joining</h3><div class="muted">Members can only join this server themselves from Discover Servers.</div></div><div class="card"><div class="row between"><div><h3 style="margin:0">Join Requests</h3><div class="muted">Used when Server Privacy is set to Public + Owner Approval.</div></div><button class="ghost" onclick="loadJoinRequests(${id})">Refresh</button></div><div id="joinRequestsList" style="margin-top:10px">Loading...</div></div>
-   <div class="card"><div class="row between"><h3 style="margin:0">Custom Roles</h3><button class="primary" onclick="createCustomRole(${id})">＋ Role</button></div><div style="margin-top:10px">${state.serverRoles.length?state.serverRoles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">Custom access role</div></div><button class="danger" onclick="deleteCustomRole(${id},${r.id})">Delete</button></div>`).join(""):'<div class="muted">No custom roles yet.</div>'}</div>
+   <div class="card"><div class="row between"><h3 style="margin:0">Custom Roles</h3>${hasServerPerm("manage_roles")?`<button class="primary" onclick="createCustomRole(${id})">＋ Role</button>`:""}</div><div style="margin-top:10px">${state.serverRoles.length?state.serverRoles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">${Object.entries(r.permissions||{}).filter(([k,v])=>v).length} enabled permission${Object.entries(r.permissions||{}).filter(([k,v])=>v).length===1?"":"s"}</div></div><button class="ghost" onclick="editCustomRole(${id},${r.id})">Edit Permissions</button><button class="danger" onclick="deleteCustomRole(${id},${r.id})">Delete</button></div>`).join(""):'<div class="muted">No custom roles yet.</div>'}</div>
    <div class="card"><h3>Members (${d.members.length})</h3>${d.members.map(m=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)}</div></div>${m.role!=="owner"?`<button class="ghost" onclick="changeServerRoleFromSettings(${id},${m.id})">Staff Role</button><button class="ghost" onclick="manageMemberCustomRoles(${id},${m.id},'${esc(m.username)}')">Custom Roles</button><button class="danger" onclick="removeServerMember(${id},${m.id})">Remove</button>`:""}</div>`).join("")}</div>
    <div class="card"><h3>Danger zone</h3><button class="danger" onclick="deleteServer(${id})">Delete server</button></div>`);
    setTimeout(()=>loadJoinRequests(id),20);
@@ -1633,7 +2004,7 @@ function renderSettings(){
  <form class="formGrid" onsubmit="changePassword(event)" style="margin-top:14px"><div class="label">New password</div><input id="newPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters"><button class="ghost">Change password</button></form></div>
  <div class="card"><h3>Notifications</h3><div class="muted" style="margin-bottom:12px">SpookChat can show a Windows/browser popup when a new DM or group message arrives while the app is in the background.</div><div class="row"><button class="primary" type="button" onclick="enableDesktopNotifications()">Enable desktop notifications</button><button class="ghost" type="button" onclick="disableDesktopNotifications()">Disable</button></div></div>
  <div class="card"><h3>Desktop App</h3><div class="muted" style="margin-bottom:12px">Install the Windows desktop version of SpookChat.</div><a class="primary" href="/static/downloads/SpookChatPCSet-up.exe" download="SpookChatPCSet-up.exe" style="display:inline-block;text-decoration:none">Download SpookChat for Windows</a></div>
- ${state.profile.global_role==="owner"?`<div class="card"><h3>Owner Security</h3><div class="muted" style="margin-bottom:12px">Set a separate password required before viewing sensitive moderation account records.</div><form class="formGrid" onsubmit="setAccountInfoPassword(event)"><div class="label">Account Info Access Password</div><input id="accountInfoAccessPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters" required><button class="primary">Set / Change Access Password</button></form></div>`:""}<div class="card"><h3>Session</h3><button class="danger" onclick="logout()">Log out of SpookChat</button></div></div></div></div>`;
+ ${state.profile.global_role==="owner"?`<div class="card"><h3>Owner Security</h3><div class="muted" style="margin-bottom:12px">Set a separate password required before viewing sensitive moderation account records.</div><form class="formGrid" onsubmit="setAccountInfoPassword(event)"><div class="label">Account Info Access Password</div><input id="accountInfoAccessPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters" required><button class="primary">Set / Change Access Password</button></form></div>`:""}${state.profile.global_role==="owner"?`<div class="card"><h3>Owner</h3><button class="primary" onclick="showOwnerPanel()">Open Owner Control Center</button></div>`:""}<div class="card"><h3>Session</h3><button class="danger" onclick="logout()">Log out of SpookChat</button></div></div></div></div>`;
 }
 async function saveProfile(e){e.preventDefault();try{const d=await api("/api/profile",{method:"PATCH",body:JSON.stringify({username:setUsername.value,pronouns:setPronouns.value,company:setCompany.value,avatar:setAvatar.value,description:setDescription.value})});state.profile=d.profile;state.servers=(await api("/api/servers")).servers;toast("Profile saved");renderApp()}catch(e){toast(e.message)}}
 async function changePassword(e){e.preventDefault();try{await api("/api/account/password",{method:"POST",body:JSON.stringify({password:newPassword.value})});newPassword.value="";toast("Password changed")}catch(e){toast(e.message)}}
@@ -1644,14 +2015,104 @@ async function savePreferences(){try{const body={theme:themeSelect.value};if(doc
 function createChannelPrompt(){modalOpen("Create channel",`<form class="formGrid" onsubmit="createChannel(event)"><div class="label">Channel name</div><input id="newChannelName" class="field" maxlength="40" required><div class="label">Type</div><select id="newChannelKind" class="field"><option value="chat">Chat</option><option value="announcement">Announcement</option></select><div class="modalActions"><button class="primary">Create</button></div></form>`)}
 async function createChannel(e){e.preventDefault();try{await api(`/api/servers/${state.activeServer}/channels`,{method:"POST",body:JSON.stringify({name:newChannelName.value,kind:newChannelKind.value})});modalClose();await openServer(state.activeServer)}catch(e){toast(e.message)}}
 
-async function channelMenu(ev,cid){ev.preventDefault();ev.stopPropagation();if(state.serverInfo.my_role!=="owner")return;overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-230)}px" onclick="event.stopPropagation()"><button onclick="channelSettings(${cid});closeContext()">⚙ Channel settings</button><button onclick="showSpookHooks(${cid});closeContext()">🔗 SpookHooks (Beta)</button><button class="red" onclick="deleteChannel(${cid});closeContext()">🗑 Delete channel</button></div>`}
-function permissionChoices(selected,prefix){const built=[["member","Member"],["moderator","Moderator"],["admin","Admin"],["owner","Owner"]];const custom=state.serverRoles.map(r=>[`custom:${r.id}`,r.name]);return [...built,...custom].map(([v,n])=>`<label class="row"><input type="checkbox" data-${prefix}="${esc(v)}" ${selected.includes(v)?"checked":""}> ${esc(n)}</label>`).join("")}
-async function channelSettings(cid){const c=state.serverChannels.find(x=>Number(x.id)===Number(cid));if(!c)return;modalOpen("Channel settings",`<form class="formGrid" onsubmit="saveChannelSettings(event,${cid})"><div class="label">Channel name</div><input id="channelSetName" class="field" value="${esc(c.name)}"><div class="grid2"><div class="card"><h3>Who can VIEW</h3>${permissionChoices(c.view_roles,"viewrole")}</div><div class="card"><h3>Who can TALK</h3>${permissionChoices(c.talk_roles,"talkrole")}</div></div><div class="muted">Owner always has access regardless of these settings.</div><div class="modalActions"><button class="primary">Save channel</button></div></form>`)}
-async function saveChannelSettings(e,cid){e.preventDefault();const view_roles=[...document.querySelectorAll("[data-viewrole]:checked")].map(x=>x.dataset.viewrole);const talk_roles=[...document.querySelectorAll("[data-talkrole]:checked")].map(x=>x.dataset.talkrole);try{await api(`/api/servers/${state.activeServer}/channels/${cid}`,{method:"PATCH",body:JSON.stringify({name:channelSetName.value,view_roles,talk_roles})});modalClose();await openServer(state.activeServer,cid);toast("Channel updated")}catch(e){toast(e.message)}}
+async function channelMenu(ev,cid){ev.preventDefault();ev.stopPropagation();if(!hasServerPerm("manage_channels"))return;overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-230)}px" onclick="event.stopPropagation()"><button onclick="channelSettings(${cid});closeContext()">⚙ Channel settings</button><button onclick="showSpookHooks(${cid});closeContext()">🔗 SpookHooks (Beta)</button><button class="red" onclick="deleteChannel(${cid});closeContext()">🗑 Delete channel</button></div>`}
+function channelRoleOptions(){
+ const built=[["member","Member"],["moderator","Moderator"],["admin","Admin"],["owner","Owner"]];
+ return [...built,...state.serverRoles.map(r=>[`custom:${r.id}`,r.name])];
+}
+async function channelSettings(cid){
+ const c=state.serverChannels.find(x=>Number(x.id)===Number(cid));if(!c)return;
+ let overrides=[];
+ try{overrides=(await api(`/api/servers/${state.activeServer}/channels/${cid}/role-overrides`)).overrides}catch(e){}
+ modalOpen("Channel settings",`<form class="formGrid" onsubmit="saveChannelNameOnly(event,${cid})"><div class="label">Channel name</div><input id="channelSetName" class="field" value="${esc(c.name)}"><button class="ghost">Save Channel Name</button></form>
+ <div class="card" style="margin-top:14px"><h3>Role Permissions</h3><div class="muted" style="margin-bottom:10px">Choose a role, then set each channel permission to Allow, Deny, or Inherit from the server role.</div><select id="channelRoleSelector" class="field" onchange="renderSelectedChannelRolePermissions(${cid})">${channelRoleOptions().map(([k,n])=>`<option value="${esc(k)}">${esc(n)}</option>`).join("")}</select><div id="channelRolePermissionEditor" style="margin-top:12px"></div></div>`);
+ window._channelOverrides=overrides;
+ setTimeout(()=>renderSelectedChannelRolePermissions(cid),20);
+}
+async function saveChannelNameOnly(e,cid){
+ e.preventDefault();
+ try{
+   const c=state.serverChannels.find(x=>Number(x.id)===Number(cid));
+   await api(`/api/servers/${state.activeServer}/channels/${cid}`,{method:"PATCH",body:JSON.stringify({name:channelSetName.value,view_roles:c.view_roles,talk_roles:c.talk_roles})});
+   await openServer(state.activeServer,cid);toast("Channel renamed");
+ }catch(e){toast(e.message)}
+}
+function renderSelectedChannelRolePermissions(cid){
+ const roleKey=channelRoleSelector.value;
+ const existing=(window._channelOverrides||[]).find(x=>x.role_key===roleKey)||{allow:[],deny:[]};
+ const perms=[
+   ["view_channels","View Channel"],
+   ["send_messages","Send Messages"],
+   ["manage_messages","Manage Messages"],
+   ["manage_spookhooks","Manage SpookHooks"]
+ ];
+ channelRolePermissionEditor.innerHTML=perms.map(([key,label])=>{
+   const stateValue=existing.deny.includes(key)?"deny":existing.allow.includes(key)?"allow":"inherit";
+   return `<div class="listItem"><div class="listMain"><div class="listTitle">${label}</div></div><select class="field" style="width:150px" data-chanperm="${key}"><option value="inherit" ${stateValue==="inherit"?"selected":""}>Inherit</option><option value="allow" ${stateValue==="allow"?"selected":""}>Allow</option><option value="deny" ${stateValue==="deny"?"selected":""}>Deny</option></select></div>`;
+ }).join("")+`<button class="primary" style="margin-top:12px" onclick="saveSelectedChannelRolePermissions(${cid})">Save Role Channel Permissions</button>`;
+}
+async function saveSelectedChannelRolePermissions(cid){
+ const roleKey=channelRoleSelector.value;
+ const allow=[],deny=[];
+ document.querySelectorAll("[data-chanperm]").forEach(x=>{if(x.value==="allow")allow.push(x.dataset.chanperm);if(x.value==="deny")deny.push(x.dataset.chanperm)});
+ try{
+   await api(`/api/servers/${state.activeServer}/channels/${cid}/role-overrides/${encodeURIComponent(roleKey)}`,{method:"PUT",body:JSON.stringify({allow,deny})});
+   const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/role-overrides`);
+   window._channelOverrides=d.overrides;
+   toast("Channel role permissions saved");
+ }catch(e){toast(e.message)}
+}
+
 async function deleteChannel(cid){if(!confirm("Delete this channel and its messages?"))return;try{await api(`/api/servers/${state.activeServer}/channels/${cid}`,{method:"DELETE"});await openServer(state.activeServer);toast("Channel deleted")}catch(e){toast(e.message)}}
 
-function createCustomRole(sid){modalOpen("Create custom role",`<form class="formGrid" onsubmit="saveNewCustomRole(event,${sid})"><input id="newCustomRoleName" class="field" maxlength="30" placeholder="VIP" required><div class="modalActions"><button class="primary">Create role</button></div></form>`)}
-async function saveNewCustomRole(e,sid){e.preventDefault();try{await api(`/api/servers/${sid}/roles`,{method:"POST",body:JSON.stringify({name:newCustomRoleName.value})});modalClose();state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;showServerSettings(sid)}catch(e){toast(e.message)}}
+const SERVER_PERMISSION_LABELS={
+ administrator:["Administrator","Gives every server permission except Delete Server."],
+ view_channels:["View Channels","Can see server channels unless a channel override denies it."],
+ send_messages:["Send Messages","Can text in channels unless a channel override denies it."],
+ invite_members:["Invite Members","Can create and manage server invite links."],
+ manage_channels:["Manage Channels","Can create, rename, delete, and configure channels."],
+ manage_roles:["Manage Roles","Can create/edit roles and assign custom roles."],
+ manage_members:["Manage Members","Can remove members and manage member settings."],
+ mute_members:["Mute Members","Can restrict members from talking."],
+ ban_members:["Ban Members","Can ban and unban members."],
+ manage_messages:["Manage Messages","Can delete other members' messages."],
+ manage_spookhooks:["Manage SpookHooks","Can create and delete SpookHooks."],
+ manage_server:["Manage Server","Can change server name, icon, and privacy. Cannot delete the server."]
+};
+function rolePermissionChecks(perms,prefix){
+ return Object.entries(SERVER_PERMISSION_LABELS).map(([key,[name,desc]])=>`<label class="listItem" style="cursor:pointer"><input type="checkbox" data-${prefix}="${key}" ${perms?.[key]?"checked":""}><div class="listMain"><div class="listTitle">${name}</div><div class="listSub">${desc}</div></div></label>`).join("");
+}
+function collectRolePermissions(prefix){
+ const out={};
+ document.querySelectorAll(`[data-${prefix}]`).forEach(x=>out[x.dataset[prefix]]=x.checked);
+ return out;
+}
+function createCustomRole(sid){
+ modalOpen("Create custom role",`<form class="formGrid" onsubmit="saveNewCustomRole(event,${sid})"><div class="label">Role name</div><input id="newCustomRoleName" class="field" maxlength="30" placeholder="VIP" required><div class="card"><h3>Permissions</h3>${rolePermissionChecks({},"newroleperm")}</div><div class="modalActions"><button class="primary">Create role</button></div></form>`);
+}
+async function saveNewCustomRole(e,sid){
+ e.preventDefault();
+ try{
+   await api(`/api/servers/${sid}/roles`,{method:"POST",body:JSON.stringify({name:newCustomRoleName.value,permissions:collectRolePermissions("newroleperm")})});
+   modalClose();
+   state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;
+   showServerSettings(sid);
+ }catch(e){toast(e.message)}
+}
+function editCustomRole(sid,rid){
+ const r=state.serverRoles.find(x=>Number(x.id)===Number(rid));if(!r)return;
+ modalOpen("Edit role permissions",`<form class="formGrid" onsubmit="saveEditedCustomRole(event,${sid},${rid})"><div class="label">Role name</div><input id="editRoleName" class="field" maxlength="30" value="${esc(r.name)}"><div class="card"><h3>Permissions</h3>${rolePermissionChecks(r.permissions||{},"editroleperm")}</div><div class="modalActions"><button class="primary">Save Permissions</button></div></form>`);
+}
+async function saveEditedCustomRole(e,sid,rid){
+ e.preventDefault();
+ try{
+   await api(`/api/servers/${sid}/roles/${rid}`,{method:"PATCH",body:JSON.stringify({name:editRoleName.value,permissions:collectRolePermissions("editroleperm")})});
+   modalClose();
+   state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;
+   showServerSettings(sid);
+   toast("Role permissions updated");
+ }catch(e){toast(e.message)}
+}
 async function deleteCustomRole(sid,rid){if(!confirm("Delete this custom role?"))return;try{await api(`/api/servers/${sid}/roles/${rid}`,{method:"DELETE"});state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;modalClose();showServerSettings(sid)}catch(e){toast(e.message)}}
 async function manageMemberCustomRoles(sid,uid,username){try{const d=await api(`/api/servers/${sid}/members/${uid}/custom-roles`);modalOpen("Roles for "+username,`<div class="formGrid">${state.serverRoles.length?state.serverRoles.map(r=>`<label class="row"><input type="checkbox" ${d.role_ids.includes(r.id)?"checked":""} onchange="toggleMemberCustomRole(${sid},${uid},${r.id},this.checked)"> ${esc(r.name)}</label>`).join(""):'<div class="muted">Create custom roles first.</div>'}</div>`)}catch(e){toast(e.message)}}
 async function toggleMemberCustomRole(sid,uid,rid,enabled){try{await api(`/api/servers/${sid}/members/${uid}/custom-role`,{method:"POST",body:JSON.stringify({role_id:rid,enabled})});toast("Role assignment updated")}catch(e){toast(e.message)}}
@@ -1712,6 +2173,146 @@ async function forceTemporaryPassword(uid){
  try{
    const d=await api(`/api/owner/user-force-password-reset/${uid}`,{method:"POST"});
    modalOpen("Temporary Password Created",`<div class="muted">The previous password no longer works. Give this temporary password to the account owner through a secure method.</div><input id="temporaryPasswordBox" class="field" readonly value="${esc(d.temporary_password)}" style="margin-top:12px"><button class="primary" style="margin-top:10px" onclick="navigator.clipboard.writeText(temporaryPasswordBox.value);toast('Copied')">Copy Temporary Password</button>`);
+ }catch(e){toast(e.message)}
+}
+
+
+const SITE_PERMISSION_LABELS={
+ view_moderation:["View Moderation","Can open the moderation center."],
+ manage_users:["Manage Users","Can manage user bans and account actions."],
+ manage_reports:["Manage Reports","Can review and resolve reports."],
+ manage_ip_bans:["Manage IP Bans","Can view and manage IP bans."],
+ manage_global_roles:["Manage Global Roles","Can manage built-in global roles where allowed."],
+ manage_site_roles:["Manage Site Roles","Can work with custom site-wide roles."],
+ view_audit_log:["View Audit Log","Can inspect owner/site administration activity."]
+};
+
+function showOwnerPanel(){
+ state.view="owner";state.activeServer=null;renderApp();
+}
+
+async function renderOwnerPanel(){
+ appShell.classList.remove("with-members");
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">Owner Control Center</div><div class="topSub">Whole-site administration</div></div><div class="topActions">${notificationBellButton()}</div></header>
+ <div class="page"><div class="pageHero"><div><h1>Owner Control Center</h1><div class="muted">Manage SpookChat as a platform.</div></div></div>
+ <div id="ownerStats" class="grid2"></div>
+ <div class="grid2">
+   <div class="card"><h3>Site Controls</h3><div id="ownerSiteControls">Loading...</div></div>
+   <div class="card"><h3>Global Announcement</h3><div class="muted" style="margin-bottom:10px">Shown to everyone in the app.</div><textarea id="ownerAnnouncement" class="field" rows="5" maxlength="500"></textarea><button class="primary" style="margin-top:10px" onclick="saveOwnerSettings()">Save Announcement</button></div>
+ </div>
+ <div class="card"><div class="row between"><div><h3 style="margin:0">Custom Site Roles</h3><div class="muted">Users can have multiple custom site-wide roles at once.</div></div><button class="primary" onclick="createSiteRole()">＋ Create Site Role</button></div><div id="ownerSiteRoles" style="margin-top:12px">Loading...</div></div>
+ <div class="card"><h3>Assign Multiple Roles</h3><div class="searchBox"><input id="ownerUserRoleSearch" class="field" placeholder="Username or Spook ID (#123)"><button class="primary" onclick="ownerSearchUsersForRoles()">Search</button></div><div id="ownerRoleUserResults"></div></div>
+ <div class="card"><div class="row between"><div><h3 style="margin:0">Owner Audit Log</h3><div class="muted">Recent website administration actions.</div></div><button class="ghost" onclick="loadOwnerAudit()">Refresh</button></div><div id="ownerAuditList" style="margin-top:12px">Loading...</div></div>
+ </div>`;
+ await loadOwnerDashboard();
+ await loadOwnerSiteRoles();
+ await loadOwnerAudit();
+}
+
+async function loadOwnerDashboard(){
+ try{
+   const d=await api("/api/owner/dashboard");
+   const s=d.settings,st=d.stats;
+   ownerStats.innerHTML=[
+     ["Users",st.users],["Active 24h",st.active_24h],["Servers",st.servers],["Messages",st.messages],
+     ["Open Reports",st.open_reports],["Banned Users",st.banned_users],["IP Bans",st.ip_bans]
+   ].map(([n,v])=>`<div class="card"><div class="muted">${n}</div><div style="font-size:28px;font-weight:900;margin-top:5px">${v}</div></div>`).join("");
+   ownerSiteControls.innerHTML=`<div class="formGrid">
+     <label class="row"><input id="ownerMaintenance" type="checkbox" ${s.maintenance_mode?"checked":""}> <div><div class="listTitle">Maintenance Mode</div><div class="listSub">Normal users are blocked while you can still access Owner controls.</div></div></label>
+     <div class="label">Maintenance message</div><textarea id="ownerMaintenanceMessage" class="field" rows="3">${esc(s.maintenance_message)}</textarea>
+     <label class="row"><input id="ownerRegistrations" type="checkbox" ${s.registrations_enabled?"checked":""}> <div><div class="listTitle">Allow New Registrations</div><div class="listSub">Turn off to stop new account creation.</div></div></label>
+     <div class="label">Site name</div><input id="ownerSiteName" class="field" value="${esc(s.site_name)}">
+     <button class="danger" onclick="confirmMaintenanceToggle()">${s.maintenance_mode?"Disable Maintenance Mode":"Enable Maintenance Mode"}</button>
+     <button class="primary" onclick="saveOwnerSettings()">Save Site Settings</button>
+   </div>`;
+   ownerAnnouncement.value=s.announcement||"";
+ }catch(e){toast(e.message)}
+}
+
+async function confirmMaintenanceToggle(){
+ const enable=!ownerMaintenance.checked;
+ if(enable && !confirm("Enable Maintenance Mode? Normal users will be blocked from SpookChat until you turn it off."))return;
+ ownerMaintenance.checked=enable;
+ await saveOwnerSettings();
+}
+
+async function saveOwnerSettings(){
+ try{
+   const d=await api("/api/owner/site-settings",{method:"PATCH",body:JSON.stringify({
+     maintenance_mode:ownerMaintenance.checked,
+     maintenance_message:ownerMaintenanceMessage.value,
+     registrations_enabled:ownerRegistrations.checked,
+     site_name:ownerSiteName.value,
+     announcement:ownerAnnouncement.value
+   })});
+   toast("Site settings saved");
+   await loadOwnerDashboard();
+ }catch(e){toast(e.message)}
+}
+
+function siteRolePermissionChecks(perms,prefix){
+ return Object.entries(SITE_PERMISSION_LABELS).map(([key,[name,desc]])=>`<label class="listItem" style="cursor:pointer"><input type="checkbox" data-${prefix}="${key}" ${perms?.[key]?"checked":""}><div class="listMain"><div class="listTitle">${name}</div><div class="listSub">${desc}</div></div></label>`).join("");
+}
+function collectSiteRolePermissions(prefix){
+ const out={};document.querySelectorAll(`[data-${prefix}]`).forEach(x=>out[x.dataset[prefix]]=x.checked);return out;
+}
+async function loadOwnerSiteRoles(){
+ try{
+   const d=await api("/api/owner/site-roles");
+   window._siteRoles=d.roles;
+   ownerSiteRoles.innerHTML=d.roles.length?d.roles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">${Object.values(r.permissions||{}).filter(Boolean).length} permissions</div></div><button class="ghost" onclick="editSiteRole(${r.id})">Edit</button><button class="danger" onclick="deleteSiteRole(${r.id})">Delete</button></div>`).join(""):`<div class="muted">No custom site roles yet.</div>`;
+ }catch(e){toast(e.message)}
+}
+function createSiteRole(){
+ modalOpen("Create Site Role",`<form class="formGrid" onsubmit="saveNewSiteRole(event)"><div class="label">Role name</div><input id="newSiteRoleName" class="field" maxlength="40" required><div class="card"><h3>Permissions</h3>${siteRolePermissionChecks({},"newsiteperm")}</div><div class="modalActions"><button class="primary">Create Role</button></div></form>`);
+}
+async function saveNewSiteRole(e){
+ e.preventDefault();
+ try{
+   await api("/api/owner/site-roles",{method:"POST",body:JSON.stringify({name:newSiteRoleName.value,permissions:collectSiteRolePermissions("newsiteperm")})});
+   modalClose();toast("Site role created");loadOwnerSiteRoles();
+ }catch(e){toast(e.message)}
+}
+function editSiteRole(rid){
+ const r=(window._siteRoles||[]).find(x=>x.id===rid);if(!r)return;
+ modalOpen("Edit Site Role",`<form class="formGrid" onsubmit="saveEditedSiteRole(event,${rid})"><div class="label">Role name</div><input id="editSiteRoleName" class="field" value="${esc(r.name)}"><div class="card"><h3>Permissions</h3>${siteRolePermissionChecks(r.permissions||{},"editsiteperm")}</div><div class="modalActions"><button class="primary">Save Role</button></div></form>`);
+}
+async function saveEditedSiteRole(e,rid){
+ e.preventDefault();
+ try{
+   await api(`/api/owner/site-roles/${rid}`,{method:"PATCH",body:JSON.stringify({name:editSiteRoleName.value,permissions:collectSiteRolePermissions("editsiteperm")})});
+   modalClose();toast("Role updated");loadOwnerSiteRoles();
+ }catch(e){toast(e.message)}
+}
+async function deleteSiteRole(rid){
+ if(!confirm("Delete this site role? It will be removed from everyone who has it."))return;
+ try{await api(`/api/owner/site-roles/${rid}`,{method:"DELETE"});toast("Role deleted");loadOwnerSiteRoles()}catch(e){toast(e.message)}
+}
+
+async function ownerSearchUsersForRoles(){
+ const q=ownerUserRoleSearch.value.trim();
+ try{
+   const d=await api("/api/staff/users?q="+encodeURIComponent(q)+"&limit=100");
+   ownerRoleUserResults.innerHTML=d.users.length?d.users.map(u=>`<div class="listItem"><img class="avatar" src="${avatarSrc(u.avatar)}"><div class="listMain"><div class="listTitle">${esc(u.username)}</div><div class="listSub">Spook ID #${u.id} · ${esc(u.global_role)}</div></div><button class="ghost" onclick="manageUserSiteRoles(${u.id})">Manage Roles</button></div>`).join(""):`<div class="muted">No users found.</div>`;
+ }catch(e){toast(e.message)}
+}
+async function manageUserSiteRoles(uid){
+ try{
+   const d=await api(`/api/owner/users/${uid}/roles`);
+   const assigned=new Set(d.assigned.map(r=>r.id));
+   modalOpen("Roles for "+d.user.username,`<div class="muted">Built-in global role: ${esc(d.user.global_role)}</div><div class="card" style="margin-top:12px"><h3>Custom Site Roles</h3>${d.all_roles.length?d.all_roles.map(r=>`<label class="listItem" style="cursor:pointer"><input type="checkbox" ${assigned.has(r.id)?"checked":""} onchange="toggleUserSiteRole(${uid},${r.id},this.checked)"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">${Object.values(r.permissions||{}).filter(Boolean).length} permissions</div></div></label>`).join(""):'<div class="muted">Create a site role first.</div>'}</div>`);
+ }catch(e){toast(e.message)}
+}
+async function toggleUserSiteRole(uid,rid,enabled){
+ try{
+   await api(`/api/owner/users/${uid}/roles/${rid}`,{method:enabled?"POST":"DELETE"});
+   toast(enabled?"Role assigned":"Role removed");
+ }catch(e){toast(e.message)}
+}
+async function loadOwnerAudit(){
+ try{
+   const d=await api("/api/owner/audit-log");
+   ownerAuditList.innerHTML=d.logs.length?d.logs.map(l=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(l.action)}</div><div class="listSub">${esc(l.actor_username||"Unknown")} · ${esc(l.target_type)} ${esc(l.target_id)} · ${new Date(l.created_at).toLocaleString()}</div><div style="margin-top:4px">${esc(l.details||"")}</div></div></div>`).join(""):`<div class="muted">No audit events yet.</div>`;
  }catch(e){toast(e.message)}
 }
 
@@ -1888,8 +2489,25 @@ def health():
     except Exception as e:
         return jsonify(ok=False, database=False, error=str(e)), 500
 
+
+@app.get("/api/site-status")
+def site_status():
+    s=get_site_settings()
+    return jsonify(
+        maintenance_mode=s["maintenance_mode"],
+        maintenance_message=s["maintenance_message"],
+        registrations_enabled=s["registrations_enabled"],
+        site_name=s["site_name"],
+        announcement=s["announcement"]
+    )
+
 @app.post("/api/register")
 def register():
+    settings=get_site_settings()
+    if not settings["registrations_enabled"]:
+        return jsonify(error="New registrations are currently disabled."),403
+    if settings["maintenance_mode"]:
+        return jsonify(error=settings["maintenance_message"]),503
     if ip_is_banned(client_ip()):
         return jsonify(error="This IP address is banned."), 403
     d = request.get_json(silent=True) or {}
@@ -2347,14 +2965,13 @@ def server_get(sid):
             (banned_until is null or banned_until<=now())) from servers where id=%s
         """, (sid,sid)).fetchone()
     if not s:return jsonify(error="Server not found"),404
-    return jsonify(server={"id":s[0],"name":s[1],"icon":s[2],"owner_id":s[3],"privacy_mode":s[4],"member_count":s[5],"my_role":sm["role"]})
+    return jsonify(server={"id":s[0],"name":s[1],"icon":s[2],"owner_id":s[3],"privacy_mode":s[4],"member_count":s[5],"my_role":sm["role"],"permissions":sorted(server_permissions_for_user(sid,request.me["id"]))})
 
 @app.patch("/api/servers/<int:sid>")
 @login_required
 def server_edit(sid):
-    sm = server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":
-        return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_server"):
+        return jsonify(error="Manage Server permission required"),403
     d=request.get_json(silent=True) or {}
     name=str(d.get("name","")).strip()[:60];icon=str(d.get("icon",""))[:500]
     if not name:return jsonify(error="Server name required"),400
@@ -2369,7 +2986,7 @@ def server_edit(sid):
 @login_required
 def server_delete(sid):
     sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_spookhooks"):return jsonify(error="Manage SpookHooks permission required"),403
     with connect() as c:c.execute("delete from servers where id=%s",(sid,));c.commit()
     return jsonify(ok=True)
 
@@ -2400,9 +3017,9 @@ def server_member_add(sid):
 @app.delete("/api/servers/<int:sid>/members/<int:uid>")
 @login_required
 def server_member_remove(sid,uid):
-    sm=server_member(sid,request.me["id"])
     target=server_member(sid,uid)
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_members"):
+        return jsonify(error="Manage Members permission required"),403
     if not target or target["role"]=="owner":return jsonify(error="Cannot remove the owner"),400
     with connect() as c:c.execute("delete from server_members where server_id=%s and user_id=%s",(sid,uid));c.commit()
     return jsonify(ok=True)
@@ -2413,35 +3030,42 @@ def server_member_action():
     d=request.get_json(silent=True) or {}
     sid=d.get("server_id");uid=d.get("user_id");action=d.get("action")
     actor=server_member(sid,request.me["id"]);target=server_member(sid,uid)
-    if not actor or not target:return jsonify(error="Server member not found"),404
-    if target["role"]=="owner":return jsonify(error="The server owner cannot be moderated"),403
-    if server_level(actor["role"]) <= server_level(target["role"]) and actor["role"]!="owner":
-        return jsonify(error="You cannot manage this member"),403
+    if not actor or not target:
+        return jsonify(error="Server member not found"),404
+    if target["role"]=="owner":
+        return jsonify(error="The server owner cannot be moderated"),403
+
     mins=max(1,min(int(d.get("minutes") or 60),525600))
     until=datetime.now(timezone.utc)+timedelta(minutes=mins)
+
     with connect() as c:
         if action=="mute":
-            if actor["role"] not in ("moderator","admin","owner"):return jsonify(error="No permission"),403
+            if not has_server_permission(sid,request.me["id"],"mute_members"):
+                return jsonify(error="Mute Members permission required"),403
             c.execute("update server_members set muted_until=%s where server_id=%s and user_id=%s",(until,sid,uid))
         elif action=="unmute":
-            if actor["role"] not in ("moderator","admin","owner"):return jsonify(error="No permission"),403
+            if not has_server_permission(sid,request.me["id"],"mute_members"):
+                return jsonify(error="Mute Members permission required"),403
             c.execute("update server_members set muted_until=null where server_id=%s and user_id=%s",(sid,uid))
         elif action=="ban":
-            if actor["role"] not in ("admin","owner"):return jsonify(error="Admin/Owner only"),403
+            if not has_server_permission(sid,request.me["id"],"ban_members"):
+                return jsonify(error="Ban Members permission required"),403
             c.execute("update server_members set banned_until=%s where server_id=%s and user_id=%s",(until,sid,uid))
         elif action=="unban":
-            if actor["role"] not in ("admin","owner"):return jsonify(error="Admin/Owner only"),403
+            if not has_server_permission(sid,request.me["id"],"ban_members"):
+                return jsonify(error="Ban Members permission required"),403
             c.execute("update server_members set banned_until=null where server_id=%s and user_id=%s",(sid,uid))
         elif action=="role":
-            if actor["role"]!="owner":return jsonify(error="Server owner only"),403
+            if not has_server_permission(sid,request.me["id"],"manage_roles"):
+                return jsonify(error="Manage Roles permission required"),403
             role=d.get("role")
-            if role not in ("member","moderator","admin"):return jsonify(error="Invalid role"),400
+            if role not in ("member","moderator","admin"):
+                return jsonify(error="Invalid role"),400
             c.execute("update server_members set role=%s where server_id=%s and user_id=%s",(role,sid,uid))
         else:
             return jsonify(error="Invalid action"),400
         c.commit()
     return jsonify(ok=True)
-
 
 
 @app.get("/api/servers/<int:sid>/join-requests")
@@ -2513,8 +3137,8 @@ def server_channels_get(sid):
 @app.post("/api/servers/<int:sid>/channels")
 @login_required
 def server_channel_create(sid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_channels"):
+        return jsonify(error="Manage Channels permission required"),403
     d=request.get_json(silent=True) or {}
     name=str(d.get("name","")).strip().lower().replace(" ","-")[:40]
     if not name:return jsonify(error="Channel name required"),400
@@ -2535,8 +3159,8 @@ def server_channel_create(sid):
 @app.patch("/api/servers/<int:sid>/channels/<int:cid>")
 @login_required
 def server_channel_edit(sid,cid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_channels"):
+        return jsonify(error="Manage Channels permission required"),403
     d=request.get_json(silent=True) or {}
     with connect() as c:
         old=c.execute("select name,view_roles,talk_roles from server_channels where id=%s and server_id=%s",(cid,sid)).fetchone()
@@ -2555,8 +3179,8 @@ def server_channel_edit(sid,cid):
 @app.delete("/api/servers/<int:sid>/channels/<int:cid>")
 @login_required
 def server_channel_delete(sid,cid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_channels"):
+        return jsonify(error="Manage Channels permission required"),403
     with connect() as c:
         count=c.execute("select count(*) from server_channels where server_id=%s",(sid,)).fetchone()[0]
         if count<=1:return jsonify(error="A server must keep at least one channel"),400
@@ -2566,37 +3190,79 @@ def server_channel_delete(sid,cid):
 @app.get("/api/servers/<int:sid>/roles")
 @login_required
 def server_roles_get(sid):
-    if not server_member(sid,request.me["id"]):return jsonify(error="Not a server member"),403
+    if not server_member(sid,request.me["id"]):
+        return jsonify(error="Not a server member"),403
     with connect() as c:
-        rows=c.execute("select id,name from server_roles where server_id=%s order by id",(sid,)).fetchall()
-    return jsonify(roles=[{"id":r[0],"name":r[1]} for r in rows])
+        rows=c.execute("""
+            select id,name,permissions
+            from server_roles
+            where server_id=%s
+            order by id
+        """,(sid,)).fetchall()
+    return jsonify(
+        roles=[{"id":r[0],"name":r[1],"permissions":r[2] or {}} for r in rows],
+        permission_keys=SERVER_PERMISSION_KEYS
+    )
 
 @app.post("/api/servers/<int:sid>/roles")
 @login_required
 def server_role_create(sid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
-    name=str((request.get_json(silent=True) or {}).get("name","")).strip()[:30]
-    if not name:return jsonify(error="Role name required"),400
+    if not has_server_permission(sid,request.me["id"],"manage_roles"):
+        return jsonify(error="Manage Roles permission required"),403
+    d=request.get_json(silent=True) or {}
+    name=str(d.get("name","")).strip()[:30]
+    if not name:
+        return jsonify(error="Role name required"),400
+    raw=d.get("permissions") or {}
+    perms={k:bool(raw.get(k,False)) for k in SERVER_PERMISSION_KEYS} if isinstance(raw,dict) else {}
     try:
         with connect() as c:
-            rid=c.execute("insert into server_roles(server_id,name) values(%s,%s) returning id",(sid,name)).fetchone()[0];c.commit()
+            rid=c.execute("""
+                insert into server_roles(server_id,name,permissions)
+                values(%s,%s,%s) returning id
+            """,(sid,name,psycopg.types.json.Jsonb(perms))).fetchone()[0]
+            c.commit()
         return jsonify(id=rid)
-    except psycopg.errors.UniqueViolation:return jsonify(error="Role already exists"),409
+    except psycopg.errors.UniqueViolation:
+        return jsonify(error="Role already exists"),409
+
+@app.patch("/api/servers/<int:sid>/roles/<int:rid>")
+@login_required
+def server_role_edit(sid,rid):
+    if not has_server_permission(sid,request.me["id"],"manage_roles"):
+        return jsonify(error="Manage Roles permission required"),403
+    d=request.get_json(silent=True) or {}
+    with connect() as c:
+        old=c.execute("select name,permissions from server_roles where id=%s and server_id=%s",(rid,sid)).fetchone()
+        if not old:
+            return jsonify(error="Role not found"),404
+        name=str(d.get("name",old[0])).strip()[:30]
+        raw=d.get("permissions",old[1] or {})
+        if not isinstance(raw,dict):
+            return jsonify(error="Invalid permissions"),400
+        perms={k:bool(raw.get(k,False)) for k in SERVER_PERMISSION_KEYS}
+        c.execute("""
+            update server_roles set name=%s,permissions=%s
+            where id=%s and server_id=%s
+        """,(name,psycopg.types.json.Jsonb(perms),rid,sid))
+        c.commit()
+    return jsonify(ok=True)
 
 @app.delete("/api/servers/<int:sid>/roles/<int:rid>")
 @login_required
 def server_role_delete(sid,rid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
-    with connect() as c:c.execute("delete from server_roles where id=%s and server_id=%s",(rid,sid));c.commit()
+    if not has_server_permission(sid,request.me["id"],"manage_roles"):
+        return jsonify(error="Manage Roles permission required"),403
+    with connect() as c:
+        c.execute("delete from server_roles where id=%s and server_id=%s",(rid,sid))
+        c.commit()
     return jsonify(ok=True)
 
 @app.post("/api/servers/<int:sid>/members/<int:uid>/custom-role")
 @login_required
 def server_custom_role_assign(sid,uid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_roles"):
+        return jsonify(error="Manage Roles permission required"),403
     d=request.get_json(silent=True) or {};rid=int(d.get("role_id") or 0);enabled=bool(d.get("enabled",True))
     with connect() as c:
         valid=c.execute("select 1 from server_roles where id=%s and server_id=%s",(rid,sid)).fetchone()
@@ -2616,11 +3282,67 @@ def server_custom_roles_get(sid,uid):
         rows=c.execute("select role_id from server_member_roles where server_id=%s and user_id=%s",(sid,uid)).fetchall()
     return jsonify(role_ids=[r[0] for r in rows])
 
+
+@app.get("/api/servers/<int:sid>/channels/<int:cid>/role-overrides")
+@login_required
+def channel_role_overrides_get(sid,cid):
+    if not server_member(sid,request.me["id"]):
+        return jsonify(error="Not a server member"),403
+    with connect() as c:
+        rows=c.execute("""
+            select role_key,allow_permissions,deny_permissions
+            from channel_role_overrides
+            where channel_id=%s
+        """,(cid,)).fetchall()
+    return jsonify(overrides=[{
+        "role_key":r[0],
+        "allow":r[1] or [],
+        "deny":r[2] or []
+    } for r in rows])
+
+@app.put("/api/servers/<int:sid>/channels/<int:cid>/role-overrides/<role_key>")
+@login_required
+def channel_role_override_set(sid,cid,role_key):
+    if not has_server_permission(sid,request.me["id"],"manage_channels"):
+        return jsonify(error="Manage Channels permission required"),403
+    with connect() as c:
+        channel=c.execute("select 1 from server_channels where id=%s and server_id=%s",(cid,sid)).fetchone()
+        if not channel:
+            return jsonify(error="Channel not found"),404
+
+    d=request.get_json(silent=True) or {}
+    allow=[p for p in (d.get("allow") or []) if p in ("view_channels","send_messages","manage_messages","manage_spookhooks")]
+    deny=[p for p in (d.get("deny") or []) if p in ("view_channels","send_messages","manage_messages","manage_spookhooks")]
+
+    # A permission can't be both.
+    allow=[p for p in allow if p not in deny]
+
+    valid_builtin={"member","moderator","admin","owner"}
+    if role_key not in valid_builtin:
+        if not role_key.startswith("custom:"):
+            return jsonify(error="Invalid role"),400
+        try: rid=int(role_key.split(":",1)[1])
+        except Exception:return jsonify(error="Invalid role"),400
+        with connect() as c:
+            if not c.execute("select 1 from server_roles where id=%s and server_id=%s",(rid,sid)).fetchone():
+                return jsonify(error="Role not found"),404
+
+    with connect() as c:
+        c.execute("""
+            insert into channel_role_overrides(channel_id,role_key,allow_permissions,deny_permissions)
+            values(%s,%s,%s,%s)
+            on conflict(channel_id,role_key)
+            do update set allow_permissions=excluded.allow_permissions,
+                          deny_permissions=excluded.deny_permissions
+        """,(cid,role_key,psycopg.types.json.Jsonb(allow),psycopg.types.json.Jsonb(deny)))
+        c.commit()
+    return jsonify(ok=True)
+
 @app.get("/api/servers/<int:sid>/channels/<int:cid>/spookhooks")
 @login_required
 def spookhooks_get(sid,cid):
     sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_spookhooks"):return jsonify(error="Manage SpookHooks permission required"),403
     with connect() as c:
         rows=c.execute("select id,name,created_at from spookhooks where server_id=%s and channel_id=%s order by id desc",(sid,cid)).fetchall()
     return jsonify(hooks=[{"id":r[0],"name":r[1],"created_at":r[2].isoformat()} for r in rows])
@@ -2629,7 +3351,7 @@ def spookhooks_get(sid,cid):
 @login_required
 def spookhook_create(sid,cid):
     sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    if not has_server_permission(sid,request.me["id"],"manage_spookhooks"):return jsonify(error="Manage SpookHooks permission required"),403
     with connect() as c:
         channel=c.execute("select 1 from server_channels where id=%s and server_id=%s",(cid,sid)).fetchone()
         if not channel:return jsonify(error="Channel not found"),404
@@ -2673,9 +3395,8 @@ def spookhook_receive(token):
 @app.get("/api/servers/<int:sid>/invites")
 @login_required
 def server_invites_get(sid):
-    sm = server_member(sid, request.me["id"])
-    if not sm or sm["role"] != "owner":
-        return jsonify(error="Server owner only"), 403
+    if not has_server_permission(sid,request.me["id"],"invite_members"):
+        return jsonify(error="Invite Members permission required"),403
     with connect() as c:
         rows = c.execute("""
             select id,code,uses,created_at
@@ -2695,9 +3416,8 @@ def server_invites_get(sid):
 @app.post("/api/servers/<int:sid>/invites")
 @login_required
 def server_invite_create(sid):
-    sm = server_member(sid, request.me["id"])
-    if not sm or sm["role"] != "owner":
-        return jsonify(error="Server owner only"), 403
+    if not has_server_permission(sid,request.me["id"],"invite_members"):
+        return jsonify(error="Invite Members permission required"),403
     alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     for _ in range(10):
         code = "".join(secrets.choice(alphabet) for _ in range(8))
@@ -2716,9 +3436,8 @@ def server_invite_create(sid):
 @app.delete("/api/servers/<int:sid>/invites/<int:iid>")
 @login_required
 def server_invite_delete(sid,iid):
-    sm = server_member(sid, request.me["id"])
-    if not sm or sm["role"] != "owner":
-        return jsonify(error="Server owner only"), 403
+    if not has_server_permission(sid,request.me["id"],"invite_members"):
+        return jsonify(error="Invite Members permission required"),403
     with connect() as c:
         c.execute("delete from server_invites where id=%s and server_id=%s",(iid,sid))
         c.commit()
@@ -2938,8 +3657,7 @@ def message_delete(mid):
         if not m:return jsonify(error="Message not found"),404
         allowed=m[0]==request.me["id"] or request.me["global_role"] in ("moderator","admin","owner")
         if m[1]=="server" and m[2]:
-            sm=server_member(m[2],request.me["id"])
-            allowed=allowed or bool(sm and sm["role"] in ("moderator","admin","owner"))
+            allowed=allowed or has_server_permission(m[2],request.me["id"],"manage_messages")
         if not allowed:return jsonify(error="No permission"),403
         c.execute("delete from messages where id=%s",(mid,));c.commit()
     return jsonify(ok=True)
@@ -3037,6 +3755,163 @@ def owner_force_password_reset(uid):
                   (generate_password_hash(temporary),uid))
         c.commit()
     return jsonify(ok=True,temporary_password=temporary)
+
+
+@app.get("/api/owner/dashboard")
+@staff_required("owner")
+def owner_dashboard():
+    with connect() as c:
+        total_users=c.execute("select count(*) from users").fetchone()[0]
+        total_servers=c.execute("select count(*) from servers").fetchone()[0]
+        total_messages=c.execute("select count(*) from messages").fetchone()[0]
+        total_reports=c.execute("select count(*) from reports where status='open'").fetchone()[0]
+        active_24h=c.execute("select count(*) from users where last_seen>=now()-interval '24 hours'").fetchone()[0]
+        banned_users=c.execute("select count(*) from users where banned_until>now()").fetchone()[0]
+        ip_bans=c.execute("select count(*) from ip_bans").fetchone()[0]
+    return jsonify(
+        settings=get_site_settings(),
+        stats={
+            "users":total_users,
+            "servers":total_servers,
+            "messages":total_messages,
+            "open_reports":total_reports,
+            "active_24h":active_24h,
+            "banned_users":banned_users,
+            "ip_bans":ip_bans
+        }
+    )
+
+@app.patch("/api/owner/site-settings")
+@staff_required("owner")
+def owner_site_settings():
+    d=request.get_json(silent=True) or {}
+    current=get_site_settings()
+    maintenance=bool(d.get("maintenance_mode",current["maintenance_mode"]))
+    registrations=bool(d.get("registrations_enabled",current["registrations_enabled"]))
+    msg=str(d.get("maintenance_message",current["maintenance_message"]))[:500]
+    site_name=str(d.get("site_name",current["site_name"])).strip()[:60] or "SpookChat"
+    announcement=str(d.get("announcement",current["announcement"]))[:500]
+    with connect() as c:
+        c.execute("""
+            update site_settings
+            set maintenance_mode=%s,maintenance_message=%s,registrations_enabled=%s,
+                site_name=%s,announcement=%s,updated_at=now()
+            where id=1
+        """,(maintenance,msg,registrations,site_name,announcement))
+        c.commit()
+    audit_owner_action(request.me["id"],"update_site_settings","site","1",
+                       f"maintenance={maintenance}, registrations={registrations}")
+    return jsonify(ok=True,settings=get_site_settings())
+
+@app.get("/api/owner/site-roles")
+@staff_required("owner")
+def owner_site_roles_get():
+    with connect() as c:
+        rows=c.execute("select id,name,permissions,created_at from site_roles order by name").fetchall()
+    return jsonify(
+        roles=[{"id":r[0],"name":r[1],"permissions":r[2] or {},"created_at":r[3].isoformat()} for r in rows],
+        permission_keys=SITE_ROLE_PERMISSION_KEYS
+    )
+
+@app.post("/api/owner/site-roles")
+@staff_required("owner")
+def owner_site_role_create():
+    d=request.get_json(silent=True) or {}
+    name=str(d.get("name","")).strip()[:40]
+    if not name:return jsonify(error="Role name required"),400
+    raw=d.get("permissions") or {}
+    perms={k:bool(raw.get(k,False)) for k in SITE_ROLE_PERMISSION_KEYS} if isinstance(raw,dict) else {}
+    try:
+        with connect() as c:
+            rid=c.execute("""
+                insert into site_roles(name,permissions) values(%s,%s) returning id
+            """,(name,psycopg.types.json.Jsonb(perms))).fetchone()[0]
+            c.commit()
+        audit_owner_action(request.me["id"],"create_site_role","site_role",rid,name)
+        return jsonify(id=rid)
+    except psycopg.errors.UniqueViolation:
+        return jsonify(error="A site role with that name already exists"),409
+
+@app.patch("/api/owner/site-roles/<int:rid>")
+@staff_required("owner")
+def owner_site_role_edit(rid):
+    d=request.get_json(silent=True) or {}
+    with connect() as c:
+        old=c.execute("select name,permissions from site_roles where id=%s",(rid,)).fetchone()
+        if not old:return jsonify(error="Role not found"),404
+        name=str(d.get("name",old[0])).strip()[:40]
+        raw=d.get("permissions",old[1] or {})
+        perms={k:bool(raw.get(k,False)) for k in SITE_ROLE_PERMISSION_KEYS}
+        c.execute("update site_roles set name=%s,permissions=%s where id=%s",
+                  (name,psycopg.types.json.Jsonb(perms),rid))
+        c.commit()
+    audit_owner_action(request.me["id"],"edit_site_role","site_role",rid,name)
+    return jsonify(ok=True)
+
+@app.delete("/api/owner/site-roles/<int:rid>")
+@staff_required("owner")
+def owner_site_role_delete(rid):
+    with connect() as c:
+        c.execute("delete from site_roles where id=%s",(rid,))
+        c.commit()
+    audit_owner_action(request.me["id"],"delete_site_role","site_role",rid,"")
+    return jsonify(ok=True)
+
+@app.get("/api/owner/users/<int:uid>/roles")
+@staff_required("owner")
+def owner_user_roles_get(uid):
+    user=row_user(uid)
+    if not user:return jsonify(error="User not found"),404
+    with connect() as c:
+        assigned=c.execute("""
+            select sr.id,sr.name,sr.permissions
+            from user_site_roles usr join site_roles sr on sr.id=usr.role_id
+            where usr.user_id=%s order by sr.name
+        """,(uid,)).fetchall()
+        all_roles=c.execute("select id,name,permissions from site_roles order by name").fetchall()
+    return jsonify(
+        user={"id":uid,"username":user["username"],"global_role":user["global_role"]},
+        assigned=[{"id":r[0],"name":r[1],"permissions":r[2] or {}} for r in assigned],
+        all_roles=[{"id":r[0],"name":r[1],"permissions":r[2] or {}} for r in all_roles]
+    )
+
+@app.post("/api/owner/users/<int:uid>/roles/<int:rid>")
+@staff_required("owner")
+def owner_user_role_assign(uid,rid):
+    if not row_user(uid):return jsonify(error="User not found"),404
+    with connect() as c:
+        if not c.execute("select 1 from site_roles where id=%s",(rid,)).fetchone():
+            return jsonify(error="Role not found"),404
+        c.execute("insert into user_site_roles(user_id,role_id) values(%s,%s) on conflict do nothing",(uid,rid))
+        c.commit()
+    audit_owner_action(request.me["id"],"assign_site_role","user",uid,f"role_id={rid}")
+    return jsonify(ok=True)
+
+@app.delete("/api/owner/users/<int:uid>/roles/<int:rid>")
+@staff_required("owner")
+def owner_user_role_remove(uid,rid):
+    with connect() as c:
+        c.execute("delete from user_site_roles where user_id=%s and role_id=%s",(uid,rid))
+        c.commit()
+    audit_owner_action(request.me["id"],"remove_site_role","user",uid,f"role_id={rid}")
+    return jsonify(ok=True)
+
+@app.get("/api/owner/audit-log")
+@staff_required("owner")
+def owner_audit_log_get():
+    with connect() as c:
+        rows=c.execute("""
+            select l.id,l.action,l.target_type,l.target_id,l.details,l.created_at,
+                   u.username
+            from owner_audit_log l
+            left join users u on u.id=l.actor_id
+            order by l.created_at desc
+            limit 300
+        """).fetchall()
+    return jsonify(logs=[{
+        "id":r[0],"action":r[1],"target_type":r[2],"target_id":r[3],
+        "details":r[4],"created_at":r[5].isoformat(),"actor_username":r[6]
+    } for r in rows])
 
 @app.get("/api/staff/users")
 @staff_required("moderator","admin","owner")
