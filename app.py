@@ -116,25 +116,42 @@ def connect():
         raise RuntimeError("DATABASE_URL is missing")
     return psycopg.connect(DATABASE_URL)
 
-def ensure_column(cur, table, column, definition):
-    cur.execute("""
-        select 1 from information_schema.columns
-        where table_schema='public' and table_name=%s and column_name=%s
-    """, (table, column))
-    if not cur.fetchone():
-        cur.execute(f'alter table "{table}" add column "{column}" {definition}')
-
 def init_db():
     if not DATABASE_URL:
         return
     try:
         with connect() as c:
+            # Create all base tables first.
             c.execute(SCHEMA)
-            ensure_column(c, "users", "last_ip", "text not null default ''")
-            ensure_column(c, "friends", "status", "text not null default 'accepted'")
-            ensure_column(c, "server_members", "joined_at", "timestamptz not null default now()")
-            ensure_column(c, "messages", "edited_at", "timestamptz")
+
+            # Repair/upgrade databases created by older SpookChat versions.
+            # PostgreSQL safely ignores these when the columns already exist.
+            c.execute("alter table users add column if not exists last_ip text not null default ''")
+            c.execute("alter table users add column if not exists description text not null default ''")
+            c.execute("alter table users add column if not exists avatar text not null default ''")
+            c.execute("alter table users add column if not exists pronouns text not null default ''")
+            c.execute("alter table users add column if not exists company text not null default ''")
+            c.execute("alter table users add column if not exists global_role text not null default 'user'")
+            c.execute("alter table users add column if not exists banned_until timestamptz")
+            c.execute("alter table users add column if not exists created_at timestamptz not null default now()")
+
+            c.execute("alter table friends add column if not exists status text not null default 'accepted'")
+
+            c.execute("alter table server_members add column if not exists banned_until timestamptz")
+            c.execute("alter table server_members add column if not exists muted_until timestamptz")
+            c.execute("alter table server_members add column if not exists joined_at timestamptz not null default now()")
+
+            c.execute("alter table messages add column if not exists edited_at timestamptz")
+
+            c.execute("alter table reports add column if not exists status text not null default 'open'")
+            c.execute("alter table reports add column if not exists created_at timestamptz not null default now()")
+
+            c.execute("alter table ip_bans add column if not exists banned_until timestamptz")
+            c.execute("alter table ip_bans add column if not exists reason text not null default ''")
+            c.execute("alter table ip_bans add column if not exists created_at timestamptz not null default now()")
+
             c.commit()
+            print("SpookChat database migration complete.")
     except Exception as e:
         print("DATABASE INITIALIZATION ERROR:", repr(e))
 
@@ -701,7 +718,14 @@ def health():
     try:
         with connect() as c:
             c.execute("select 1").fetchone()
-        return jsonify(ok=True, database=True)
+            cols = c.execute("""
+                select column_name from information_schema.columns
+                where table_schema='public' and table_name='users'
+            """).fetchall()
+            names = {r[0] for r in cols}
+            required = {"id","email","username","password_hash","global_role","banned_until","last_ip"}
+            missing = sorted(required - names)
+        return jsonify(ok=(len(missing)==0), database=True, missing_columns=missing), (200 if not missing else 500)
     except Exception as e:
         return jsonify(ok=False, database=False, error=str(e)), 500
 
