@@ -1,5 +1,6 @@
 import os
 import secrets
+import hashlib
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -34,6 +35,9 @@ create table if not exists users(
  global_role text not null default 'user',
  banned_until timestamptz,
  last_ip text not null default '',
+ device_type text not null default 'PC',
+ theme text not null default 'original',
+ show_staff_tag boolean not null default true,
  created_at timestamptz not null default now()
 );
 
@@ -62,6 +66,44 @@ create table if not exists server_members(
  primary key(server_id,user_id)
 );
 
+
+create table if not exists server_roles(
+ id bigserial primary key,
+ server_id bigint not null references servers(id) on delete cascade,
+ name text not null,
+ created_at timestamptz not null default now(),
+ unique(server_id,name)
+);
+
+create table if not exists server_member_roles(
+ server_id bigint not null references servers(id) on delete cascade,
+ user_id bigint not null references users(id) on delete cascade,
+ role_id bigint not null references server_roles(id) on delete cascade,
+ primary key(server_id,user_id,role_id)
+);
+
+create table if not exists server_channels(
+ id bigserial primary key,
+ server_id bigint not null references servers(id) on delete cascade,
+ name text not null,
+ kind text not null default 'chat',
+ view_roles jsonb not null default '["member","moderator","admin","owner"]'::jsonb,
+ talk_roles jsonb not null default '["member","moderator","admin","owner"]'::jsonb,
+ position integer not null default 0,
+ created_at timestamptz not null default now(),
+ unique(server_id,name)
+);
+
+create table if not exists spookhooks(
+ id bigserial primary key,
+ server_id bigint not null references servers(id) on delete cascade,
+ channel_id bigint not null references server_channels(id) on delete cascade,
+ created_by bigint not null references users(id) on delete cascade,
+ name text not null default 'SpookHook',
+ token_hash text not null unique,
+ created_at timestamptz not null default now()
+);
+
 create table if not exists chats(
  id bigserial primary key,
  kind text not null,
@@ -86,6 +128,8 @@ create table if not exists messages(
  server_id bigint references servers(id) on delete cascade,
  chat_id bigint references chats(id) on delete cascade,
  edited_at timestamptz,
+ is_spookhook boolean not null default false,
+ hook_name text not null default '',
  created_at timestamptz not null default now()
 );
 
@@ -135,6 +179,11 @@ def init_db():
             c.execute("alter table users add column if not exists banned_until timestamptz")
             c.execute("alter table users add column if not exists created_at timestamptz not null default now()")
 
+            c.execute("alter table users add column if not exists device_type text not null default 'PC'")
+            c.execute("alter table users add column if not exists theme text not null default 'original'")
+            c.execute("alter table users add column if not exists show_staff_tag boolean not null default true")
+
+
             c.execute("alter table friends add column if not exists status text not null default 'accepted'")
 
             c.execute("alter table server_members add column if not exists banned_until timestamptz")
@@ -142,6 +191,36 @@ def init_db():
             c.execute("alter table server_members add column if not exists joined_at timestamptz not null default now()")
 
             c.execute("alter table messages add column if not exists edited_at timestamptz")
+
+            c.execute("alter table messages add column if not exists is_spookhook boolean not null default false")
+            c.execute("alter table messages add column if not exists hook_name text not null default ''")
+
+            # Seed the two original server channels for old and new servers.
+            c.execute("""
+                insert into server_channels(server_id,name,kind,view_roles,talk_roles,position)
+                select s.id,'announcements','announcement',
+                       '["member","moderator","admin","owner"]'::jsonb,
+                       '["moderator","admin","owner"]'::jsonb,0
+                from servers s
+                where not exists(select 1 from server_channels c2 where c2.server_id=s.id and c2.name='announcements')
+            """)
+            c.execute("""
+                insert into server_channels(server_id,name,kind,view_roles,talk_roles,position)
+                select s.id,'chat','chat',
+                       '["member","moderator","admin","owner"]'::jsonb,
+                       '["member","moderator","admin","owner"]'::jsonb,1
+                from servers s
+                where not exists(select 1 from server_channels c2 where c2.server_id=s.id and c2.name='chat')
+            """)
+            # Move old server messages that used "chat"/"announcement" names onto channel IDs.
+            c.execute("""
+                update messages m set channel=sc.id::text
+                from server_channels sc
+                where m.kind='server' and m.server_id=sc.server_id
+                  and ((m.channel='chat' and sc.name='chat')
+                    or (m.channel='announcement' and sc.name='announcements'))
+            """)
+
 
             c.execute("alter table reports add column if not exists status text not null default 'open'")
             c.execute("alter table reports add column if not exists created_at timestamptz not null default now()")
@@ -157,6 +236,12 @@ def init_db():
 
 init_db()
 
+
+def device_type():
+    ua = (request.headers.get("user-agent") or "").lower()
+    mobile_words = ("android","iphone","ipad","ipod","mobile","windows phone")
+    return "Mobile" if any(x in ua for x in mobile_words) else "PC"
+
 def client_ip():
     # Vercel supplies x-forwarded-for. We only use the first IP inserted by the edge.
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -168,13 +253,13 @@ def row_user(uid):
     with connect() as c:
         r = c.execute("""
             select id,email,username,description,avatar,pronouns,company,
-                   global_role,banned_until,last_ip,created_at
+                   global_role,banned_until,last_ip,device_type,theme,show_staff_tag,created_at
             from users where id=%s
         """, (uid,)).fetchone()
     if not r:
         return None
     keys = ["id","email","username","description","avatar","pronouns","company",
-            "global_role","banned_until","last_ip","created_at"]
+            "global_role","banned_until","last_ip","device_type","theme","show_staff_tag","created_at"]
     return dict(zip(keys, r))
 
 def current_user():
@@ -202,7 +287,7 @@ def login_required(fn):
             return jsonify(error="Your account is temporarily banned."), 403
         try:
             with connect() as c:
-                c.execute("update users set last_ip=%s where id=%s", (client_ip(), u["id"]))
+                c.execute("update users set last_ip=%s,device_type=%s where id=%s", (client_ip(), device_type(), u["id"]))
                 c.commit()
         except Exception:
             pass
@@ -234,6 +319,32 @@ def server_member(sid, uid):
 def server_level(role):
     return {"member":0, "moderator":1, "admin":2, "owner":3}.get(role, -1)
 
+
+def server_custom_roles(sid, uid):
+    with connect() as c:
+        rows = c.execute("""
+            select smr.role_id from server_member_roles smr
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,uid)).fetchall()
+    return {f"custom:{r[0]}" for r in rows}
+
+def channel_access(sid, channel_id, uid, mode):
+    sm = server_member(sid,uid)
+    if not sm:
+        return False
+    if sm["role"] == "owner":
+        return True
+    with connect() as c:
+        r = c.execute("""
+            select view_roles,talk_roles from server_channels where id=%s and server_id=%s
+        """,(channel_id,sid)).fetchone()
+    if not r:
+        return False
+    allowed = set(r[0] if mode=="view" else r[1])
+    if sm["role"] in allowed:
+        return True
+    return bool(server_custom_roles(sid,uid) & allowed)
+
 def global_level(role):
     return {"user":0, "moderator":1, "admin":2, "owner":3}.get(role, -1)
 
@@ -257,6 +368,12 @@ HTML = r"""
  --line:#2a2134;--purple:#8957ff;--purple2:#b14cff;
  --text:#f6f2ff;--muted:#9b93aa;--danger:#ff5368;--good:#35d07f;
 }
+
+body.theme-dark{--bg:#090909;--side:#0d0d0d;--panel:#121212;--panel2:#181818;--line:#292929;--purple:#777;--purple2:#aaa;--text:#f4f4f4;--muted:#999}
+body.theme-light{--bg:#f5f3f8;--side:#ffffff;--panel:#ffffff;--panel2:#f0edf4;--line:#ded8e5;--purple:#7651d8;--purple2:#9a55d8;--text:#1d1822;--muted:#716b78;background:#f5f3f8}
+body.theme-light .topbar,body.theme-light .composer,body.theme-light .meBox{background:#fff}
+body.theme-light .field,body.theme-light .composer input{background:#fff;color:#1d1822}
+
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font:14px Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 body{overflow:hidden;background:radial-gradient(circle at 15% -10%,#28123e 0,transparent 34%),var(--bg)}
@@ -336,7 +453,7 @@ input,textarea,select{outline:none}
 <script>
 const state={
  me:null, profile:null, view:"public", channel:"chat1", messages:[],
- servers:[], activeServer:null, serverInfo:null, serverMembers:[],
+ servers:[], activeServer:null, serverInfo:null, serverMembers:[],serverChannels:[],serverRoles:[],
  activeChat:null, poll:null
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
@@ -348,6 +465,7 @@ async function api(path,opts={}){
  return d;
 }
 function toast(msg){toastWrap.innerHTML=`<div class="toast">${esc(msg)}</div>`;setTimeout(()=>toastWrap.innerHTML="",2500)}
+function applyTheme(theme){document.body.classList.remove("theme-dark","theme-light");if(theme==="dark")document.body.classList.add("theme-dark");if(theme==="light")document.body.classList.add("theme-light")}
 function modalOpen(title,body){modal.innerHTML=`<div class="modalWrap" onclick="if(event.target===this)modalClose()"><div class="modal"><h2>${esc(title)}</h2>${body}</div></div>`}
 function modalClose(){modal.innerHTML=""}
 function closeContext(){overlay.innerHTML=""}
@@ -357,6 +475,7 @@ async function boot(){
  try{
    const d=await api("/api/me");
    state.me=d.user;state.profile=d.profile;
+   applyTheme(state.profile.theme||"original");
    state.servers=(await api("/api/servers")).servers;
    renderApp();
  }catch(e){renderLogin()}
@@ -466,7 +585,7 @@ function drawMessages(){
  el.innerHTML=state.messages.map(m=>`<div class="msg" oncontextmenu="messageMenu(event,${m.id})">
    <img class="avatar" src="${esc(m.avatar||"")}" onerror="this.style.visibility='hidden'">
    <div class="msgBody"><div class="meta"><span class="name">${esc(m.username)}</span>
-   ${m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:""}
+   ${m.is_spookhook?`<span class="roleTag">SPOOKHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:"")}
    <span class="time">${new Date(m.created_at).toLocaleString([], {hour:'2-digit',minute:'2-digit'})}</span>
    ${m.edited_at?`<span class="edited">(edited)</span>`:""}</div><div class="text">${esc(m.content)}</div></div>
  </div>`).join("");
@@ -507,8 +626,8 @@ async function viewProfile(uid){
  try{
    const d=await api("/api/profile/"+uid);
    const p=d.profile;
-   modalOpen("User profile",`<div class="row"><img class="avatar" style="width:72px;height:72px" src="${esc(p.avatar||"")}" onerror="this.style.visibility='hidden'"><div><h2 style="margin:0">${esc(p.username)}</h2><span class="pill">${esc(p.global_role)}</span></div></div>
-   <div class="card" style="margin-top:14px"><div class="muted">${esc(p.pronouns||"No pronouns set")}</div><p>${esc(p.description||"No description.")}</p><div class="muted">${esc(p.company||"")}</div></div>
+   modalOpen("User profile",`<div class="row"><img class="avatar" style="width:72px;height:72px" src="${esc(p.avatar||"")}" onerror="this.style.visibility='hidden'"><div><h2 style="margin:0">${esc(p.username)}</h2><span class="pill">${esc(p.global_role)}</span> <span class="pill">${p.device_type==="Mobile"?"📱 Mobile":"🖥 PC"}</span></div></div>
+   <div class="card" style="margin-top:14px"><div class="listSub">Spook ID: #${p.id}</div><div class="muted" style="margin-top:8px">${esc(p.pronouns||"No pronouns set")}</div><p>${esc(p.description||"No description.")}</p><div class="muted">${esc(p.company||"")}</div></div>
    ${Number(uid)!==Number(state.me.id)?`<div class="modalActions"><button class="primary" onclick="addFriend(${uid});modalClose()">Add friend</button><button class="ghost" onclick="startDM(${uid});modalClose()">Message</button></div>`:""}`);
  }catch(e){toast(e.message)}
 }
@@ -518,7 +637,7 @@ async function renderFriendsPage(){
  appShell.classList.remove("with-members");
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">Friends</div><div class="topSub">Find people and manage conversations</div></div></header>
  <div class="page"><div class="pageHero"><div><h1>Your friends</h1><div class="muted">Search SpookChat by username or open a DM.</div></div><button class="primary" onclick="groupCreate()">＋ New group chat</button></div>
- <div class="card"><h3>Find people</h3><div class="searchBox"><input id="userSearchInput" placeholder="Search username..." onkeydown="if(event.key==='Enter')searchUsers()"><button class="primary" onclick="searchUsers()">Search</button></div><div id="userSearchResults"></div></div>
+ <div class="card"><h3>Find people</h3><div class="searchBox"><input id="userSearchInput" placeholder="Search username or Spook ID (#123)..." onkeydown="if(event.key==='Enter')searchUsers()"><button class="primary" onclick="searchUsers()">Search</button></div><div id="userSearchResults"></div></div>
  <div class="card"><h3>Friends list</h3><div id="friendsList">Loading...</div></div>
  <div class="card"><h3>Your direct & group chats</h3><div id="chatList">Loading...</div></div></div>`;
  const d=await api("/api/friends");drawFriends(d.friends);
@@ -531,7 +650,7 @@ async function searchUsers(){
  const q=userSearchInput.value.trim();if(!q){userSearchResults.innerHTML="";return}
  try{
    const d=await api("/api/users/search?q="+encodeURIComponent(q));
-   userSearchResults.innerHTML=d.users.length?d.users.map(u=>`<div class="listItem"><img class="avatar" src="${esc(u.avatar||"")}" onerror="this.style.visibility='hidden'"><div class="listMain"><div class="listTitle">${esc(u.username)}</div><div class="listSub">${esc(u.company||"")}</div></div>${u.is_friend?'<span class="pill">Friend</span>':`<button class="primary" onclick="addFriend(${u.id})">Add friend</button>`}<button class="ghost" onclick="viewProfile(${u.id})">Profile</button></div>`).join(""):`<div class="muted">No usernames found.</div>`;
+   userSearchResults.innerHTML=d.users.length?d.users.map(u=>`<div class="listItem"><img class="avatar" src="${esc(u.avatar||"")}" onerror="this.style.visibility='hidden'"><div class="listMain"><div class="listTitle">${esc(u.username)}</div><div class="listSub">#${u.id}${u.company?` · ${esc(u.company)}`:""}</div></div>${u.is_friend?'<span class="pill">Friend</span>':`<button class="primary" onclick="addFriend(${u.id})">Add friend</button>`}<button class="ghost" onclick="viewProfile(${u.id})">Profile</button></div>`).join(""):`<div class="muted">No usernames found.</div>`;
  }catch(e){toast(e.message)}
 }
 async function addFriend(uid){try{await api("/api/friends",{method:"POST",body:JSON.stringify({user_id:uid})});toast("Friend added");if(state.view==="friends"){renderFriendsPage()}}catch(e){toast(e.message)}}
@@ -589,9 +708,18 @@ async function joinServer(id){
 
 function serverCreate(){modalOpen("Create server",`<form class="formGrid" onsubmit="makeServer(event)"><div class="label">Server name</div><input id="newServerName" class="field" maxlength="60" required><div class="label">Server picture URL (optional)</div><input id="newServerIcon" class="field" maxlength="500"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create server</button></div></form>`)}
 async function makeServer(e){e.preventDefault();try{await api("/api/servers",{method:"POST",body:JSON.stringify({name:newServerName.value,icon:newServerIcon.value})});modalClose();state.servers=(await api("/api/servers")).servers;renderApp()}catch(e){toast(e.message)}}
-async function openServer(id,ch="chat"){
- state.view="server";state.activeServer=Number(id);state.channel=ch;
- try{state.serverInfo=(await api("/api/servers/"+id)).server;state.serverMembers=(await api("/api/servers/"+id+"/members")).members;renderApp()}catch(e){toast(e.message)}
+async function openServer(id,ch=null){
+ state.view="server";state.activeServer=Number(id);
+ try{
+   state.serverInfo=(await api("/api/servers/"+id)).server;
+   state.serverMembers=(await api("/api/servers/"+id+"/members")).members;
+   state.serverChannels=(await api("/api/servers/"+id+"/channels")).channels;
+   state.serverRoles=(await api("/api/servers/"+id+"/roles")).roles;
+   if(ch && !Number.isNaN(Number(ch)))state.channel=Number(ch);
+   else if(ch){const found=state.serverChannels.find(c=>c.name===ch||c.name===String(ch).replace("announcement","announcements"));state.channel=found?found.id:(state.serverChannels[0]?.id||null)}
+   else if(!state.serverChannels.some(c=>Number(c.id)===Number(state.channel)))state.channel=state.serverChannels[0]?.id||null;
+   renderApp()
+ }catch(e){toast(e.message)}
 }
 function renderServer(){
  clearInterval(state.poll);
@@ -600,18 +728,17 @@ function renderServer(){
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions">${s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Server settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div></header>
  <div style="display:flex;min-height:0;flex:1">
    <div style="width:190px;border-right:1px solid var(--line);padding:12px;background:#0d0a12">
-     <div class="sectionTitle">Channels</div>
-     <button class="channelBtn ${state.channel==="announcement"?"active":""}" onclick="openServer(${s.id},'announcement')">📢 announcements</button>
-     <button class="channelBtn ${state.channel==="chat"?"active":""}" onclick="openServer(${s.id},'chat')"># chat</button>
+     <div class="sectionTitle"><span>Channels</span>${s.my_role==="owner"?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
+     ${state.serverChannels.map(c=>`<button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</button>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
    </div>
-   <div style="min-width:0;flex:1;display:flex;flex-direction:column"><div class="content"><div id="messageList" class="messages"></div></div><div class="composer"><input id="messageInput" maxlength="4000" placeholder="${state.channel==="announcement"?"Post an announcement...":"Message #chat..."}" onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div></div>
+   <div style="min-width:0;flex:1;display:flex;flex-direction:column"><div class="content"><div id="messageList" class="messages"></div></div><div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message channel..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div></div>
  </div>`;
  renderMembers();
  loadMessages();state.poll=setInterval(loadMessages,1200);
 }
 function renderMembers(){
  const p=document.getElementById("membersPane");if(!p)return;
- p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${esc(m.avatar||"")}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${esc(m.role)}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
+ p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${esc(m.avatar||"")}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${esc(m.role)} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
 }
 function toggleMembers(){appShell.classList.toggle("with-members")}
 function serverMemberMenu(ev,uid){
@@ -633,13 +760,13 @@ async function showServerSettings(id){
    const d=await api("/api/servers/"+id+"/members");
    const s=state.serverInfo;
    modalOpen("Server settings",`<div class="formGrid"><div class="label">Server name</div><input id="serverSetName" class="field" value="${esc(s.name)}"><div class="label">Server picture URL</div><input id="serverSetIcon" class="field" value="${esc(s.icon||"")}"><button class="primary" onclick="saveServerSettings(${id})">Save server appearance</button></div>
-   <div class="card" style="margin-top:16px"><h3>Add member by username</h3><div class="searchBox"><input id="serverAddUsername" class="field" placeholder="Username"><button class="primary" onclick="addServerMember(${id})">Add</button></div></div>
-   <div class="card"><h3>Members (${d.members.length})</h3>${d.members.map(m=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)}</div></div>${m.role!=="owner"?`<button class="ghost" onclick="changeServerRoleFromSettings(${id},${m.id})">Role</button><button class="danger" onclick="removeServerMember(${id},${m.id})">Remove</button>`:""}</div>`).join("")}</div>
+   <div class="card" style="margin-top:16px"><h3>Joining</h3><div class="muted">Members can only join this server themselves from Discover Servers.</div></div>
+   <div class="card"><div class="row between"><h3 style="margin:0">Custom Roles</h3><button class="primary" onclick="createCustomRole(${id})">＋ Role</button></div><div style="margin-top:10px">${state.serverRoles.length?state.serverRoles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">Custom access role</div></div><button class="danger" onclick="deleteCustomRole(${id},${r.id})">Delete</button></div>`).join(""):'<div class="muted">No custom roles yet.</div>'}</div>
+   <div class="card"><h3>Members (${d.members.length})</h3>${d.members.map(m=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)}</div></div>${m.role!=="owner"?`<button class="ghost" onclick="changeServerRoleFromSettings(${id},${m.id})">Staff Role</button><button class="ghost" onclick="manageMemberCustomRoles(${id},${m.id},'${esc(m.username)}')">Custom Roles</button><button class="danger" onclick="removeServerMember(${id},${m.id})">Remove</button>`:""}</div>`).join("")}</div>
    <div class="card"><h3>Danger zone</h3><button class="danger" onclick="deleteServer(${id})">Delete server</button></div>`);
  }catch(e){toast(e.message)}
 }
 async function saveServerSettings(id){try{await api("/api/servers/"+id,{method:"PATCH",body:JSON.stringify({name:serverSetName.value,icon:serverSetIcon.value})});state.servers=(await api("/api/servers")).servers;state.serverInfo=(await api("/api/servers/"+id)).server;toast("Server updated");modalClose();renderApp()}catch(e){toast(e.message)}}
-async function addServerMember(id){try{await api("/api/servers/"+id+"/members",{method:"POST",body:JSON.stringify({username:serverAddUsername.value})});toast("Member added");modalClose();await openServer(id,state.channel);showServerSettings(id)}catch(e){toast(e.message)}}
 function changeServerRoleFromSettings(id,uid){changeServerRole(uid)}
 async function removeServerMember(id,uid){if(!confirm("Remove this member from the server?"))return;try{await api(`/api/servers/${id}/members/${uid}`,{method:"DELETE"});modalClose();await openServer(id,state.channel);showServerSettings(id)}catch(e){toast(e.message)}}
 async function deleteServer(id){if(!confirm("Permanently delete this server and all of its messages?"))return;try{await api("/api/servers/"+id,{method:"DELETE"});modalClose();state.activeServer=null;state.serverInfo=null;state.servers=(await api("/api/servers")).servers;openPublic("chat1")}catch(e){toast(e.message)}}
@@ -657,12 +784,35 @@ function renderSettings(){
  <div class="label">Profile picture URL</div><input id="setAvatar" class="field" maxlength="500" value="${esc(state.profile.avatar||"")}">
  <div class="label">Description</div><textarea id="setDescription" class="field" rows="5" maxlength="300">${esc(state.profile.description||"")}</textarea>
  <button class="primary">Save profile</button></form></div>
- <div><div class="card"><h3>Account</h3><div class="listItem"><div class="listMain"><div class="listTitle">Global role</div><div class="listSub">Your site-wide permission level</div></div><span class="pill">${esc(state.profile.global_role)}</span></div>
+ <div><div class="card"><h3>Account & Appearance</h3><div class="listItem"><div class="listMain"><div class="listTitle">Spook ID</div><div class="listSub">Use this to find your account precisely</div></div><span class="pill">#${state.me.id}</span></div><div class="listItem"><div class="listMain"><div class="listTitle">Global role</div><div class="listSub">Your site-wide permission level</div></div><span class="pill">${esc(state.profile.global_role)}</span></div>
+ <div class="formGrid" style="margin-top:14px"><div class="label">Theme</div><select id="themeSelect" class="field"><option value="original" ${state.profile.theme==="original"?"selected":""}>Original Dark + Purple</option><option value="dark" ${state.profile.theme==="dark"?"selected":""}>Dark</option><option value="light" ${state.profile.theme==="light"?"selected":""}>Light</option></select>${["moderator","admin","owner"].includes(state.profile.global_role)?`<label class="row"><input id="staffTagToggle" type="checkbox" ${state.profile.show_staff_tag?"checked":""}> Show my staff tag publicly</label>`:""}<button class="ghost" onclick="savePreferences()">Save appearance</button></div>
  <form class="formGrid" onsubmit="changePassword(event)" style="margin-top:14px"><div class="label">New password</div><input id="newPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters"><button class="ghost">Change password</button></form></div>
  <div class="card"><h3>Session</h3><button class="danger" onclick="logout()">Log out of SpookChat</button></div></div></div></div>`;
 }
 async function saveProfile(e){e.preventDefault();try{const d=await api("/api/profile",{method:"PATCH",body:JSON.stringify({username:setUsername.value,pronouns:setPronouns.value,company:setCompany.value,avatar:setAvatar.value,description:setDescription.value})});state.profile=d.profile;state.servers=(await api("/api/servers")).servers;toast("Profile saved");renderApp()}catch(e){toast(e.message)}}
 async function changePassword(e){e.preventDefault();try{await api("/api/account/password",{method:"POST",body:JSON.stringify({password:newPassword.value})});newPassword.value="";toast("Password changed")}catch(e){toast(e.message)}}
+
+
+async function savePreferences(){try{const body={theme:themeSelect.value};if(document.getElementById("staffTagToggle"))body.show_staff_tag=staffTagToggle.checked;const d=await api("/api/account/preferences",{method:"POST",body:JSON.stringify(body)});state.profile.theme=d.theme;state.profile.show_staff_tag=d.show_staff_tag;applyTheme(d.theme);toast("Preferences saved")}catch(e){toast(e.message)}}
+
+function createChannelPrompt(){modalOpen("Create channel",`<form class="formGrid" onsubmit="createChannel(event)"><div class="label">Channel name</div><input id="newChannelName" class="field" maxlength="40" required><div class="label">Type</div><select id="newChannelKind" class="field"><option value="chat">Chat</option><option value="announcement">Announcement</option></select><div class="modalActions"><button class="primary">Create</button></div></form>`)}
+async function createChannel(e){e.preventDefault();try{await api(`/api/servers/${state.activeServer}/channels`,{method:"POST",body:JSON.stringify({name:newChannelName.value,kind:newChannelKind.value})});modalClose();await openServer(state.activeServer)}catch(e){toast(e.message)}}
+
+async function channelMenu(ev,cid){ev.preventDefault();ev.stopPropagation();if(state.serverInfo.my_role!=="owner")return;overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-230)}px" onclick="event.stopPropagation()"><button onclick="channelSettings(${cid});closeContext()">⚙ Channel settings</button><button onclick="showSpookHooks(${cid});closeContext()">🔗 SpookHooks (Beta)</button><button class="red" onclick="deleteChannel(${cid});closeContext()">🗑 Delete channel</button></div>`}
+function permissionChoices(selected,prefix){const built=[["member","Member"],["moderator","Moderator"],["admin","Admin"],["owner","Owner"]];const custom=state.serverRoles.map(r=>[`custom:${r.id}`,r.name]);return [...built,...custom].map(([v,n])=>`<label class="row"><input type="checkbox" data-${prefix}="${esc(v)}" ${selected.includes(v)?"checked":""}> ${esc(n)}</label>`).join("")}
+async function channelSettings(cid){const c=state.serverChannels.find(x=>Number(x.id)===Number(cid));if(!c)return;modalOpen("Channel settings",`<form class="formGrid" onsubmit="saveChannelSettings(event,${cid})"><div class="label">Channel name</div><input id="channelSetName" class="field" value="${esc(c.name)}"><div class="grid2"><div class="card"><h3>Who can VIEW</h3>${permissionChoices(c.view_roles,"viewrole")}</div><div class="card"><h3>Who can TALK</h3>${permissionChoices(c.talk_roles,"talkrole")}</div></div><div class="muted">Owner always has access regardless of these settings.</div><div class="modalActions"><button class="primary">Save channel</button></div></form>`)}
+async function saveChannelSettings(e,cid){e.preventDefault();const view_roles=[...document.querySelectorAll("[data-viewrole]:checked")].map(x=>x.dataset.viewrole);const talk_roles=[...document.querySelectorAll("[data-talkrole]:checked")].map(x=>x.dataset.talkrole);try{await api(`/api/servers/${state.activeServer}/channels/${cid}`,{method:"PATCH",body:JSON.stringify({name:channelSetName.value,view_roles,talk_roles})});modalClose();await openServer(state.activeServer,cid);toast("Channel updated")}catch(e){toast(e.message)}}
+async function deleteChannel(cid){if(!confirm("Delete this channel and its messages?"))return;try{await api(`/api/servers/${state.activeServer}/channels/${cid}`,{method:"DELETE"});await openServer(state.activeServer);toast("Channel deleted")}catch(e){toast(e.message)}}
+
+function createCustomRole(sid){modalOpen("Create custom role",`<form class="formGrid" onsubmit="saveNewCustomRole(event,${sid})"><input id="newCustomRoleName" class="field" maxlength="30" placeholder="VIP" required><div class="modalActions"><button class="primary">Create role</button></div></form>`)}
+async function saveNewCustomRole(e,sid){e.preventDefault();try{await api(`/api/servers/${sid}/roles`,{method:"POST",body:JSON.stringify({name:newCustomRoleName.value})});modalClose();state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;showServerSettings(sid)}catch(e){toast(e.message)}}
+async function deleteCustomRole(sid,rid){if(!confirm("Delete this custom role?"))return;try{await api(`/api/servers/${sid}/roles/${rid}`,{method:"DELETE"});state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;modalClose();showServerSettings(sid)}catch(e){toast(e.message)}}
+async function manageMemberCustomRoles(sid,uid,username){try{const d=await api(`/api/servers/${sid}/members/${uid}/custom-roles`);modalOpen("Roles for "+username,`<div class="formGrid">${state.serverRoles.length?state.serverRoles.map(r=>`<label class="row"><input type="checkbox" ${d.role_ids.includes(r.id)?"checked":""} onchange="toggleMemberCustomRole(${sid},${uid},${r.id},this.checked)"> ${esc(r.name)}</label>`).join(""):'<div class="muted">Create custom roles first.</div>'}</div>`)}catch(e){toast(e.message)}}
+async function toggleMemberCustomRole(sid,uid,rid,enabled){try{await api(`/api/servers/${sid}/members/${uid}/custom-role`,{method:"POST",body:JSON.stringify({role_id:rid,enabled})});toast("Role assignment updated")}catch(e){toast(e.message)}}
+
+async function showSpookHooks(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`);modalOpen("SpookHooks · Beta",`<div class="muted">A SpookHook is a secret incoming link that can post messages into this channel. Never share a hook URL publicly.</div><div class="card" style="margin-top:12px"><div class="searchBox"><input id="hookName" class="field" placeholder="Hook name" value="SpookHook"><button class="primary" onclick="createSpookHook(${cid})">Create</button></div></div><div>${d.hooks.length?d.hooks.map(h=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(h.name)}</div><div class="listSub">Created ${new Date(h.created_at).toLocaleString()}</div></div><button class="danger" onclick="deleteSpookHook(${cid},${h.id})">Delete</button></div>`).join(""):'<div class="muted">No hooks for this channel.</div>'}</div>`)}catch(e){toast(e.message)}}
+async function createSpookHook(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`,{method:"POST",body:JSON.stringify({name:hookName.value})});modalOpen("SpookHook created",`<div class="card"><div class="muted">Copy this URL now. For security, SpookChat will not show this secret URL again.</div><input id="newHookUrl" class="field" value="${esc(d.url)}" readonly style="margin-top:10px"><button class="primary" style="margin-top:10px" onclick="navigator.clipboard.writeText(newHookUrl.value);toast('Copied')">Copy URL</button></div><div class="card"><div class="label">Example JSON POST body</div><pre style="white-space:pre-wrap">{"content":"Hello from my app","username":"My Bot"}</pre></div>`)}catch(e){toast(e.message)}}
+async function deleteSpookHook(cid,hid){if(!confirm("Delete this SpookHook? Its URL will stop working."))return;try{await api(`/api/servers/${state.activeServer}/spookhooks/${hid}`,{method:"DELETE"});showSpookHooks(cid)}catch(e){toast(e.message)}}
 
 function showStaff(){state.view="staff";state.activeServer=null;renderApp()}
 async function renderStaff(){
@@ -723,7 +873,7 @@ def health():
                 where table_schema='public' and table_name='users'
             """).fetchall()
             names = {r[0] for r in cols}
-            required = {"id","email","username","password_hash","global_role","banned_until","last_ip"}
+            required = {"id","email","username","password_hash","global_role","banned_until","last_ip","device_type","theme","show_staff_tag"}
             missing = sorted(required - names)
         return jsonify(ok=(len(missing)==0), database=True, missing_columns=missing), (200 if not missing else 500)
     except Exception as e:
@@ -771,7 +921,7 @@ def login():
         return jsonify(error="Account is banned."), 403
     session["uid"] = r[0]
     with connect() as c:
-        c.execute("update users set last_ip=%s where id=%s", (client_ip(), r[0]))
+        c.execute("update users set last_ip=%s,device_type=%s where id=%s", (client_ip(), device_type(), r[0]))
         c.commit()
     return jsonify(ok=True)
 
@@ -786,7 +936,7 @@ def me():
     u = request.me
     return jsonify(
         user={"id":u["id"],"email":u["email"]},
-        profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role"]}
+        profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role","device_type","theme","show_staff_tag"]}
     )
 
 @app.get("/api/profile/<int:uid>")
@@ -795,7 +945,7 @@ def profile_get(uid):
     u = row_user(uid)
     if not u:
         return jsonify(error="User not found"), 404
-    return jsonify(profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role"]})
+    return jsonify(profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role","device_type","theme","show_staff_tag"]})
 
 @app.patch("/api/profile")
 @login_required
@@ -821,7 +971,24 @@ def profile_edit():
     except psycopg.errors.UniqueViolation:
         return jsonify(error="That username is already taken."), 409
     u = row_user(request.me["id"])
-    return jsonify(profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role"]})
+    return jsonify(profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role","device_type","theme","show_staff_tag"]})
+
+
+@app.post("/api/account/preferences")
+@login_required
+def account_preferences():
+    d = request.get_json(silent=True) or {}
+    theme = str(d.get("theme", request.me["theme"]))
+    if theme not in ("original","dark","light"):
+        return jsonify(error="Invalid theme"),400
+    show_tag = bool(d.get("show_staff_tag", request.me["show_staff_tag"]))
+    if request.me["global_role"] == "user":
+        show_tag = True
+    with connect() as c:
+        c.execute("update users set theme=%s,show_staff_tag=%s where id=%s",
+                  (theme,show_tag,request.me["id"]))
+        c.commit()
+    return jsonify(ok=True,theme=theme,show_staff_tag=show_tag)
 
 @app.post("/api/account/password")
 @login_required
@@ -845,19 +1012,30 @@ def user_search():
     q = request.args.get("q","").strip()
     if len(q) < 1:
         return jsonify(users=[])
-    like = "%" + q[:50] + "%"
+    raw_id = q[1:] if q.startswith("#") else q
     with connect() as c:
-        rows = c.execute("""
-            select u.id,u.username,u.avatar,u.company,
-                   exists(
-                     select 1 from friends f
-                     where (f.user_a=%s and f.user_b=u.id) or (f.user_b=%s and f.user_a=u.id)
-                   ) as is_friend
-            from users u
-            where u.id<>%s and u.username ilike %s
-            order by case when lower(u.username)=lower(%s) then 0 else 1 end, u.username
-            limit 25
-        """, (request.me["id"],request.me["id"],request.me["id"],like,q)).fetchall()
+        if raw_id.isdigit():
+            rows = c.execute("""
+                select u.id,u.username,u.avatar,u.company,
+                       exists(
+                         select 1 from friends f
+                         where (f.user_a=%s and f.user_b=u.id) or (f.user_b=%s and f.user_a=u.id)
+                       ) as is_friend
+                from users u where u.id=%s and u.id<>%s limit 25
+            """,(request.me["id"],request.me["id"],int(raw_id),request.me["id"])).fetchall()
+        else:
+            like = "%" + q[:50] + "%"
+            rows = c.execute("""
+                select u.id,u.username,u.avatar,u.company,
+                       exists(
+                         select 1 from friends f
+                         where (f.user_a=%s and f.user_b=u.id) or (f.user_b=%s and f.user_a=u.id)
+                       ) as is_friend
+                from users u
+                where u.id<>%s and u.username ilike %s
+                order by case when lower(u.username)=lower(%s) then 0 else 1 end,u.username
+                limit 25
+            """,(request.me["id"],request.me["id"],request.me["id"],like,q)).fetchall()
     return jsonify(users=[
         {"id":r[0],"username":r[1],"avatar":r[2],"company":r[3],"is_friend":r[4]} for r in rows
     ])
@@ -1065,6 +1243,15 @@ def server_create():
                         (request.me["id"],name,icon)).fetchone()[0]
         c.execute("insert into server_members(server_id,user_id,role) values(%s,%s,'owner')",
                   (sid,request.me["id"]))
+        c.execute("""
+            insert into server_channels(server_id,name,kind,view_roles,talk_roles,position)
+            values(%s,'announcements','announcement',
+                   '["member","moderator","admin","owner"]'::jsonb,
+                   '["moderator","admin","owner"]'::jsonb,0),
+                  (%s,'chat','chat',
+                   '["member","moderator","admin","owner"]'::jsonb,
+                   '["member","moderator","admin","owner"]'::jsonb,1)
+        """,(sid,sid))
         c.commit()
     return jsonify(id=sid)
 
@@ -1112,7 +1299,7 @@ def server_members_get(sid):
     if not sm:return jsonify(error="Not a server member"),403
     with connect() as c:
         rows=c.execute("""
-            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until
+            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until,u.device_type
             from server_members sm join users u on u.id=sm.user_id
             where sm.server_id=%s order by
             case sm.role when 'owner' then 3 when 'admin' then 2 when 'moderator' then 1 else 0 end desc,
@@ -1121,21 +1308,13 @@ def server_members_get(sid):
     now=datetime.now(timezone.utc)
     return jsonify(members=[
         {"id":r[0],"username":r[1],"avatar":r[2],"role":r[3],
-         "muted":bool(r[4] and r[4]>now),"banned":bool(r[5] and r[5]>now)} for r in rows
+         "muted":bool(r[4] and r[4]>now),"banned":bool(r[5] and r[5]>now),"device_type":r[6]} for r in rows
     ])
 
 @app.post("/api/servers/<int:sid>/members")
 @login_required
 def server_member_add(sid):
-    sm=server_member(sid,request.me["id"])
-    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
-    username=str((request.get_json(silent=True) or {}).get("username","")).strip()
-    with connect() as c:
-        u=c.execute("select id from users where lower(username)=lower(%s)",(username,)).fetchone()
-        if not u:return jsonify(error="Username not found"),404
-        c.execute("insert into server_members(server_id,user_id,role) values(%s,%s,'member') on conflict(server_id,user_id) do update set banned_until=null",
-                  (sid,u[0]));c.commit()
-    return jsonify(ok=True)
+    return jsonify(error="Members must join servers themselves from Discover Servers."),403
 
 @app.delete("/api/servers/<int:sid>/members/<int:uid>")
 @login_required
@@ -1182,6 +1361,182 @@ def server_member_action():
         c.commit()
     return jsonify(ok=True)
 
+
+@app.get("/api/servers/<int:sid>/channels")
+@login_required
+def server_channels_get(sid):
+    if not server_member(sid,request.me["id"]):
+        return jsonify(error="Not a server member"),403
+    with connect() as c:
+        rows=c.execute("""
+            select id,name,kind,view_roles,talk_roles,position
+            from server_channels where server_id=%s order by position,id
+        """,(sid,)).fetchall()
+    channels=[]
+    for r in rows:
+        if channel_access(sid,r[0],request.me["id"],"view"):
+            channels.append({"id":r[0],"name":r[1],"kind":r[2],"view_roles":r[3],"talk_roles":r[4],"position":r[5]})
+    return jsonify(channels=channels)
+
+@app.post("/api/servers/<int:sid>/channels")
+@login_required
+def server_channel_create(sid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    d=request.get_json(silent=True) or {}
+    name=str(d.get("name","")).strip().lower().replace(" ","-")[:40]
+    if not name:return jsonify(error="Channel name required"),400
+    kind="announcement" if d.get("kind")=="announcement" else "chat"
+    talk='["moderator","admin","owner"]' if kind=="announcement" else '["member","moderator","admin","owner"]'
+    try:
+        with connect() as c:
+            pos=c.execute("select coalesce(max(position),-1)+1 from server_channels where server_id=%s",(sid,)).fetchone()[0]
+            cid=c.execute("""
+                insert into server_channels(server_id,name,kind,talk_roles,position)
+                values(%s,%s,%s,%s::jsonb,%s) returning id
+            """,(sid,name,kind,talk,pos)).fetchone()[0]
+            c.commit()
+        return jsonify(id=cid)
+    except psycopg.errors.UniqueViolation:
+        return jsonify(error="A channel with that name already exists"),409
+
+@app.patch("/api/servers/<int:sid>/channels/<int:cid>")
+@login_required
+def server_channel_edit(sid,cid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    d=request.get_json(silent=True) or {}
+    with connect() as c:
+        old=c.execute("select name,view_roles,talk_roles from server_channels where id=%s and server_id=%s",(cid,sid)).fetchone()
+        if not old:return jsonify(error="Channel not found"),404
+        name=str(d.get("name",old[0])).strip().lower().replace(" ","-")[:40]
+        view_roles=d.get("view_roles",old[1]);talk_roles=d.get("talk_roles",old[2])
+        if not isinstance(view_roles,list) or not isinstance(talk_roles,list):
+            return jsonify(error="Invalid permissions"),400
+        c.execute("""
+            update server_channels set name=%s,view_roles=%s,talk_roles=%s
+            where id=%s and server_id=%s
+        """,(name,psycopg.types.json.Jsonb(view_roles),psycopg.types.json.Jsonb(talk_roles),cid,sid))
+        c.commit()
+    return jsonify(ok=True)
+
+@app.delete("/api/servers/<int:sid>/channels/<int:cid>")
+@login_required
+def server_channel_delete(sid,cid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    with connect() as c:
+        count=c.execute("select count(*) from server_channels where server_id=%s",(sid,)).fetchone()[0]
+        if count<=1:return jsonify(error="A server must keep at least one channel"),400
+        c.execute("delete from server_channels where id=%s and server_id=%s",(cid,sid));c.commit()
+    return jsonify(ok=True)
+
+@app.get("/api/servers/<int:sid>/roles")
+@login_required
+def server_roles_get(sid):
+    if not server_member(sid,request.me["id"]):return jsonify(error="Not a server member"),403
+    with connect() as c:
+        rows=c.execute("select id,name from server_roles where server_id=%s order by id",(sid,)).fetchall()
+    return jsonify(roles=[{"id":r[0],"name":r[1]} for r in rows])
+
+@app.post("/api/servers/<int:sid>/roles")
+@login_required
+def server_role_create(sid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    name=str((request.get_json(silent=True) or {}).get("name","")).strip()[:30]
+    if not name:return jsonify(error="Role name required"),400
+    try:
+        with connect() as c:
+            rid=c.execute("insert into server_roles(server_id,name) values(%s,%s) returning id",(sid,name)).fetchone()[0];c.commit()
+        return jsonify(id=rid)
+    except psycopg.errors.UniqueViolation:return jsonify(error="Role already exists"),409
+
+@app.delete("/api/servers/<int:sid>/roles/<int:rid>")
+@login_required
+def server_role_delete(sid,rid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    with connect() as c:c.execute("delete from server_roles where id=%s and server_id=%s",(rid,sid));c.commit()
+    return jsonify(ok=True)
+
+@app.post("/api/servers/<int:sid>/members/<int:uid>/custom-role")
+@login_required
+def server_custom_role_assign(sid,uid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    d=request.get_json(silent=True) or {};rid=int(d.get("role_id") or 0);enabled=bool(d.get("enabled",True))
+    with connect() as c:
+        valid=c.execute("select 1 from server_roles where id=%s and server_id=%s",(rid,sid)).fetchone()
+        if not valid:return jsonify(error="Role not found"),404
+        if enabled:
+            c.execute("insert into server_member_roles(server_id,user_id,role_id) values(%s,%s,%s) on conflict do nothing",(sid,uid,rid))
+        else:
+            c.execute("delete from server_member_roles where server_id=%s and user_id=%s and role_id=%s",(sid,uid,rid))
+        c.commit()
+    return jsonify(ok=True)
+
+@app.get("/api/servers/<int:sid>/members/<int:uid>/custom-roles")
+@login_required
+def server_custom_roles_get(sid,uid):
+    if not server_member(sid,request.me["id"]):return jsonify(error="Not a server member"),403
+    with connect() as c:
+        rows=c.execute("select role_id from server_member_roles where server_id=%s and user_id=%s",(sid,uid)).fetchall()
+    return jsonify(role_ids=[r[0] for r in rows])
+
+@app.get("/api/servers/<int:sid>/channels/<int:cid>/spookhooks")
+@login_required
+def spookhooks_get(sid,cid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    with connect() as c:
+        rows=c.execute("select id,name,created_at from spookhooks where server_id=%s and channel_id=%s order by id desc",(sid,cid)).fetchall()
+    return jsonify(hooks=[{"id":r[0],"name":r[1],"created_at":r[2].isoformat()} for r in rows])
+
+@app.post("/api/servers/<int:sid>/channels/<int:cid>/spookhooks")
+@login_required
+def spookhook_create(sid,cid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    with connect() as c:
+        channel=c.execute("select 1 from server_channels where id=%s and server_id=%s",(cid,sid)).fetchone()
+        if not channel:return jsonify(error="Channel not found"),404
+        name=str((request.get_json(silent=True) or {}).get("name","SpookHook")).strip()[:40] or "SpookHook"
+        token=secrets.token_urlsafe(32);token_hash=hashlib.sha256(token.encode()).hexdigest()
+        hid=c.execute("""
+            insert into spookhooks(server_id,channel_id,created_by,name,token_hash)
+            values(%s,%s,%s,%s,%s) returning id
+        """,(sid,cid,request.me["id"],name,token_hash)).fetchone()[0];c.commit()
+    return jsonify(id=hid,url=request.host_url.rstrip("/")+"/api/spookhook/"+token)
+
+@app.delete("/api/servers/<int:sid>/spookhooks/<int:hid>")
+@login_required
+def spookhook_delete(sid,hid):
+    sm=server_member(sid,request.me["id"])
+    if not sm or sm["role"]!="owner":return jsonify(error="Server owner only"),403
+    with connect() as c:c.execute("delete from spookhooks where id=%s and server_id=%s",(hid,sid));c.commit()
+    return jsonify(ok=True)
+
+@app.post("/api/spookhook/<token>")
+def spookhook_receive(token):
+    token_hash=hashlib.sha256(token.encode()).hexdigest()
+    d=request.get_json(silent=True) or {}
+    content=str(d.get("content","")).strip()
+    if not content or len(content)>4000:return jsonify(error="content is required (max 4000 chars)"),400
+    with connect() as c:
+        h=c.execute("""
+            select h.server_id,h.channel_id,h.created_by,h.name
+            from spookhooks h where h.token_hash=%s
+        """,(token_hash,)).fetchone()
+        if not h:return jsonify(error="Invalid SpookHook"),404
+        hook_name=str(d.get("username",h[3])).strip()[:40] or h[3]
+        c.execute("""
+            insert into messages(user_id,content,kind,channel,server_id,is_spookhook,hook_name)
+            values(%s,%s,'server',%s,%s,true,%s)
+        """,(h[2],content,str(h[1]),h[0],hook_name));c.commit()
+    return jsonify(ok=True)
+
+
 # ============================================================
 # MESSAGES / REPORTS
 # ============================================================
@@ -1194,7 +1549,7 @@ def messages_get():
     with connect() as c:
         if kind=="public":
             rows=c.execute("""
-              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,u.global_role
+              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,case when u.show_staff_tag then u.global_role else 'user' end
               from messages m join users u on u.id=m.user_id
               where m.kind='public' and m.channel=%s order by m.created_at desc limit 150
             """,(channel,)).fetchall()
@@ -1202,23 +1557,29 @@ def messages_get():
             sm=server_member(sid,request.me["id"])
             if not sm:return jsonify(error="Not a server member"),403
             if sm["banned_until"] and sm["banned_until"]>datetime.now(timezone.utc):return jsonify(error="Banned"),403
+            try: channel_id=int(channel)
+            except Exception:return jsonify(error="Invalid channel"),400
+            if not channel_access(sid,channel_id,request.me["id"],"view"):return jsonify(error="You cannot view this channel"),403
             rows=c.execute("""
-              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,coalesce(sm.role,'member')
+              select m.id,m.user_id,m.content,m.created_at,m.edited_at,
+                     case when m.is_spookhook then m.hook_name else u.username end,
+                     u.avatar,coalesce(sm.role,'member'),m.is_spookhook
               from messages m join users u on u.id=m.user_id
               left join server_members sm on sm.server_id=m.server_id and sm.user_id=m.user_id
               where m.kind='server' and m.server_id=%s and m.channel=%s order by m.created_at desc limit 150
-            """,(sid,channel)).fetchall()
+            """,(sid,str(channel_id))).fetchall()
         else:
             ok=c.execute("select 1 from chat_members where chat_id=%s and user_id=%s",(cid,request.me["id"])).fetchone()
             if not ok:return jsonify(error="Not a chat member"),403
             rows=c.execute("""
-              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,u.global_role
+              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,case when u.show_staff_tag then u.global_role else 'user' end
               from messages m join users u on u.id=m.user_id
               where m.kind='dm' and m.chat_id=%s order by m.created_at desc limit 150
             """,(cid,)).fetchall()
     return jsonify(messages=[
       {"id":r[0],"user_id":r[1],"content":r[2],"created_at":r[3].isoformat(),
-       "edited_at":r[4].isoformat() if r[4] else None,"username":r[5],"avatar":r[6],"role":r[7]}
+       "edited_at":r[4].isoformat() if r[4] else None,"username":r[5],"avatar":r[6],"role":r[7],
+       "is_spookhook":bool(r[8]) if len(r)>8 else False}
       for r in reversed(rows)
     ])
 
@@ -1237,9 +1598,11 @@ def messages_post():
         if not sm:return jsonify(error="Not a server member"),403
         if sm["banned_until"] and sm["banned_until"]>now:return jsonify(error="Banned from server"),403
         if sm["muted_until"] and sm["muted_until"]>now:return jsonify(error="Restricted from talking"),403
-        if channel=="announcement" and sm["role"] not in ("owner","admin","moderator"):
-            return jsonify(error="Only server staff can post announcements"),403
-        if channel not in ("announcement","chat"):return jsonify(error="Invalid server channel"),400
+        try: channel=int(channel)
+        except Exception:return jsonify(error="Invalid channel"),400
+        if not channel_access(sid,channel,request.me["id"],"view"):return jsonify(error="You cannot view this channel"),403
+        if not channel_access(sid,channel,request.me["id"],"talk"):return jsonify(error="Your role cannot talk in this channel"),403
+        channel=str(channel)
     if kind=="dm":
         with connect() as c:
             if not c.execute("select 1 from chat_members where chat_id=%s and user_id=%s",(cid,request.me["id"])).fetchone():
