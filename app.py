@@ -807,6 +807,150 @@ body.theme-light .context{
   .page{padding:16px!important}
 }
 
+
+/* ============================================================
+   UNIVERSAL SCROLLING FIX
+   ============================================================ */
+
+/* Allow flex/grid children to actually shrink and scroll */
+html,body,#root{
+  width:100%;
+  height:100%;
+}
+
+.app{
+  min-height:0!important;
+  overflow:hidden!important;
+}
+
+.main{
+  min-height:0!important;
+  overflow:hidden!important;
+}
+
+#mainArea{
+  min-height:0!important;
+  overflow:hidden!important;
+}
+
+/* Pages such as Settings, Friends, Moderation and Discover */
+.page{
+  flex:1 1 auto!important;
+  min-height:0!important;
+  height:auto!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+  padding-bottom:42px!important;
+}
+
+/* Chat/message areas */
+.content{
+  flex:1 1 auto!important;
+  min-height:0!important;
+  overflow:hidden!important;
+}
+
+.messages{
+  height:100%!important;
+  min-height:0!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+}
+
+/* Sidebars */
+.sideScroll{
+  flex:1 1 auto!important;
+  min-height:0!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+}
+
+.servers{
+  min-height:0!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+}
+
+.membersPane{
+  min-height:0!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+}
+
+/* Server channel column */
+.main [style*="width:190px"]{
+  min-height:0;
+  overflow-y:auto;
+  overflow-x:hidden;
+}
+
+/* Every modal can scroll when it becomes taller than the screen */
+.modalWrap{
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  align-items:flex-start!important;
+  padding-top:5vh!important;
+  padding-bottom:5vh!important;
+}
+
+.modal{
+  max-height:90vh!important;
+  overflow-y:auto!important;
+  overflow-x:hidden!important;
+  overscroll-behavior:contain;
+  scrollbar-gutter:stable;
+}
+
+/* Context menus should remain accessible on short screens */
+.context{
+  max-height:80vh!important;
+  overflow-y:auto!important;
+}
+
+/* Long cards/lists should not force the whole app outside the viewport */
+.card,
+.grid2,
+.listItem,
+.formGrid{
+  min-width:0;
+}
+
+/* Mobile */
+@media(max-width:720px){
+  .app,
+  .main,
+  #mainArea{
+    min-height:0!important;
+  }
+
+  .page{
+    padding-bottom:90px!important;
+    -webkit-overflow-scrolling:touch;
+  }
+
+  .messages,
+  .sideScroll,
+  .membersPane,
+  .modal{
+    -webkit-overflow-scrolling:touch;
+  }
+
+  .modalWrap{
+    padding-top:12px!important;
+    padding-bottom:80px!important;
+  }
+
+  .modal{
+    max-height:calc(100vh - 100px)!important;
+  }
+}
+
 </style>
 </head>
 <body>
