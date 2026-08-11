@@ -951,6 +951,300 @@ html,body,#root{
   }
 }
 
+
+/* ============================================================
+   SPOOKCHAT FULL VIEWPORT / SCROLL FIX
+   Sidebar, pages, modals, server columns, mobile
+   ============================================================ */
+
+html, body, #root {
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  min-width: 0;
+}
+
+/* Main application viewport */
+.app {
+  height: 100vh !important;
+  height: 100dvh !important;
+  max-height: 100vh !important;
+  max-height: 100dvh !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+}
+
+/* LEFT SIDEBAR:
+   header fixed, nav scrolls, account bar fixed */
+.sidebar {
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+.brand {
+  flex: 0 0 auto !important;
+}
+
+.sideScroll {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+  scrollbar-gutter: stable;
+  padding-bottom: 24px !important;
+}
+
+.meBox {
+  flex: 0 0 auto !important;
+  position: relative !important;
+  bottom: auto !important;
+  margin-top: 0 !important;
+  z-index: 5;
+}
+
+/* Main content column */
+.main {
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+#mainArea {
+  flex: 1 1 0 !important;
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow: hidden !important;
+  display: flex !important;
+  flex-direction: column !important;
+}
+
+/* Top bars never scroll away */
+.topbar {
+  flex: 0 0 auto !important;
+}
+
+/* Generic full pages: Settings, Friends, Moderation, Discover, etc. */
+.page {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+  max-height: 100% !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+  scrollbar-gutter: stable;
+  padding-bottom: 48px !important;
+}
+
+/* Chat area */
+.content {
+  flex: 1 1 0 !important;
+  min-height: 0 !important;
+  max-height: 100% !important;
+  overflow: hidden !important;
+}
+
+.messages {
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+  scrollbar-gutter: stable;
+}
+
+/* Composer always visible */
+.composer {
+  flex: 0 0 auto !important;
+}
+
+/* RIGHT MEMBER PANE */
+.membersPane {
+  height: 100% !important;
+  max-height: 100% !important;
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+  scrollbar-gutter: stable;
+}
+
+/* Server internal flex containers */
+.main > div,
+#mainArea > div {
+  min-height: 0;
+}
+
+/* Force the server's channel + message row to be allowed to shrink */
+#mainArea > div[style*="display:flex"],
+#mainArea > div[style*="display: flex"] {
+  min-height: 0 !important;
+}
+
+/* Channel list column in servers */
+#mainArea div[style*="width:190px"],
+#mainArea div[style*="width: 190px"] {
+  min-height: 0 !important;
+  max-height: 100% !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+}
+
+/* Server message-side column */
+#mainArea div[style*="flex-direction:column"],
+#mainArea div[style*="flex-direction: column"] {
+  min-height: 0 !important;
+}
+
+/* Lists inside tall cards should not force viewport overflow */
+.card {
+  min-height: 0;
+}
+
+.grid2 {
+  min-height: 0;
+}
+
+/* Modals / popups */
+.modalWrap {
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  align-items: flex-start !important;
+  padding: 24px 16px !important;
+}
+
+.modal {
+  max-height: calc(100dvh - 48px) !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+  overscroll-behavior-y: contain !important;
+  scrollbar-gutter: stable;
+}
+
+/* Right-click context menus */
+.context {
+  max-height: min(520px, 80dvh) !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+}
+
+/* Server list / any legacy scroll container */
+.servers {
+  min-height: 0 !important;
+  overflow-y: auto !important;
+  overflow-x: hidden !important;
+}
+
+/* Make scrollbars visible enough to notice */
+.sideScroll::-webkit-scrollbar,
+.page::-webkit-scrollbar,
+.messages::-webkit-scrollbar,
+.membersPane::-webkit-scrollbar,
+.modal::-webkit-scrollbar,
+.context::-webkit-scrollbar {
+  width: 9px;
+}
+
+.sideScroll::-webkit-scrollbar-thumb,
+.page::-webkit-scrollbar-thumb,
+.messages::-webkit-scrollbar-thumb,
+.membersPane::-webkit-scrollbar-thumb,
+.modal::-webkit-scrollbar-thumb,
+.context::-webkit-scrollbar-thumb {
+  background: #4a345d;
+  border-radius: 20px;
+}
+
+/* MOBILE */
+@media (max-width: 720px) {
+  html, body, #root {
+    height: 100dvh !important;
+    min-height: 0 !important;
+    overflow: hidden !important;
+  }
+
+  .app {
+    height: calc(100dvh - 62px) !important;
+    max-height: calc(100dvh - 62px) !important;
+    min-height: 0 !important;
+  }
+
+  .main,
+  #mainArea {
+    height: 100% !important;
+    max-height: 100% !important;
+    min-height: 0 !important;
+  }
+
+  .mobilebar {
+    flex: 0 0 62px !important;
+    height: 62px !important;
+  }
+
+  .page {
+    padding-bottom: 100px !important;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .messages,
+  .sideScroll,
+  .membersPane,
+  .modal,
+  .context {
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .modalWrap {
+    padding: 12px 10px 80px !important;
+  }
+
+  .modal {
+    max-height: calc(100dvh - 92px) !important;
+  }
+}
+
+/* Short laptop windows / users at 100% zoom */
+@media (max-height: 700px) and (min-width: 721px) {
+  .brand {
+    height: 56px !important;
+  }
+
+  .sideBtn,
+  .serverBtn,
+  .channelBtn {
+    padding-top: 8px !important;
+    padding-bottom: 8px !important;
+  }
+
+  .sectionTitle {
+    padding-top: 8px !important;
+  }
+
+  .meBox {
+    padding-top: 7px !important;
+    padding-bottom: 7px !important;
+  }
+
+  .topbar {
+    height: 56px !important;
+  }
+}
+
 </style>
 </head>
 <body>
