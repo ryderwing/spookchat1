@@ -85,6 +85,8 @@ create table if not exists site_settings(
  registrations_enabled boolean not null default true,
  site_name text not null default 'VYNTRA',
  announcement text not null default '',
+ public_channels_locked boolean not null default false,
+ public_embeds_enabled boolean not null default true,
  updated_at timestamptz not null default now()
 );
 
@@ -213,8 +215,21 @@ create table if not exists messages(
  edited_at timestamptz,
  is_spookhook boolean not null default false,
  hook_name text not null default '',
+ reply_to_id bigint references messages(id) on delete set null,
  created_at timestamptz not null default now()
 );
+
+
+create table if not exists message_reactions(
+ message_id bigint not null references messages(id) on delete cascade,
+ user_id bigint not null references users(id) on delete cascade,
+ emoji text not null,
+ created_at timestamptz not null default now(),
+ primary key(message_id,user_id,emoji)
+);
+
+create index if not exists message_reactions_message_idx
+on message_reactions(message_id);
 
 create table if not exists reports(
  id bigserial primary key,
@@ -310,6 +325,7 @@ def init_db():
 
             c.execute("alter table messages add column if not exists is_spookhook boolean not null default false")
             c.execute("alter table messages add column if not exists hook_name text not null default ''")
+            c.execute("alter table messages add column if not exists reply_to_id bigint references messages(id) on delete set null")
 
             c.execute("alter table server_roles add column if not exists permissions jsonb not null default '{}'::jsonb")
             c.execute("""
@@ -349,6 +365,18 @@ def init_db():
                     or (m.channel='announcement' and sc.name='announcements'))
             """)
 
+
+
+            c.execute("""
+                create table if not exists message_reactions(
+                 message_id bigint not null references messages(id) on delete cascade,
+                 user_id bigint not null references users(id) on delete cascade,
+                 emoji text not null,
+                 created_at timestamptz not null default now(),
+                 primary key(message_id,user_id,emoji)
+                )
+            """)
+            c.execute("create index if not exists message_reactions_message_idx on message_reactions(message_id)")
 
             c.execute("alter table reports add column if not exists status text not null default 'open'")
             c.execute("alter table reports add column if not exists created_at timestamptz not null default now()")
@@ -396,6 +424,10 @@ def init_db():
                 )
             """)
             c.execute("insert into site_settings(id) values(1) on conflict(id) do nothing")
+
+            c.execute("alter table site_settings add column if not exists public_channels_locked boolean not null default false")
+            c.execute("alter table site_settings add column if not exists public_embeds_enabled boolean not null default true")
+
             c.execute("update site_settings set site_name='VYNTRA' where site_name='SpookChat'")
             c.execute("update site_settings set maintenance_message='VYNTRA is temporarily under maintenance.' where maintenance_message='SpookChat is temporarily under maintenance.'")
             c.execute("""
@@ -441,6 +473,19 @@ def device_type():
     ua = (request.headers.get("user-agent") or "").lower()
     mobile_words = ("android","iphone","ipad","ipod","mobile","windows phone")
     return "Mobile" if any(x in ua for x in mobile_words) else "PC"
+
+
+URL_RE = re_lib.compile(r'https?://[^\s<>"\']+', re_lib.I)
+
+def extract_first_url(text):
+    m = URL_RE.search(text or "")
+    return m.group(0)[:500] if m else ""
+
+def message_embed_allowed(kind, sid, uid):
+    if kind != "server":
+        return True
+    return has_server_permission(sid, uid, "embed_links")
+
 
 def client_ip():
     # Vercel supplies x-forwarded-for. We only use the first IP inserted by the edge.
@@ -539,18 +584,20 @@ SERVER_PERMISSION_KEYS = [
     "mute_members",
     "ban_members",
     "manage_messages",
+    "embed_links",
+    "add_reactions",
     "manage_spookhooks",
     "manage_server"
 ]
 
 ALL_SERVER_PERMISSIONS_EXCEPT_DELETE = {
     "view_channels","send_messages","invite_members","manage_channels","manage_roles",
-    "manage_members","mute_members","ban_members","manage_messages","manage_spookhooks","manage_server"
+    "manage_members","mute_members","ban_members","manage_messages","embed_links","add_reactions","manage_spookhooks","manage_server"
 }
 
 BUILTIN_SERVER_PERMISSIONS = {
-    "member": {"view_channels","send_messages"},
-    "moderator": {"view_channels","send_messages","manage_messages","mute_members"},
+    "member": {"view_channels","send_messages","add_reactions"},
+    "moderator": {"view_channels","send_messages","add_reactions","manage_messages","mute_members"},
     "admin": set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE),
     "owner": set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE) | {"delete_server"}
 }
@@ -665,7 +712,8 @@ SITE_ROLE_PERMISSION_KEYS = [
 def get_site_settings():
     with connect() as c:
         r=c.execute("""
-            select maintenance_mode,maintenance_message,registrations_enabled,site_name,announcement
+            select maintenance_mode,maintenance_message,registrations_enabled,site_name,announcement,
+                   public_channels_locked,public_embeds_enabled
             from site_settings where id=1
         """).fetchone()
     if not r:
@@ -674,14 +722,18 @@ def get_site_settings():
             "maintenance_message":"VYNTRA is temporarily under maintenance.",
             "registrations_enabled":True,
             "site_name":"VYNTRA",
-            "announcement":""
+            "announcement":"",
+            "public_channels_locked":False,
+            "public_embeds_enabled":True
         }
     return {
         "maintenance_mode":bool(r[0]),
         "maintenance_message":r[1],
         "registrations_enabled":bool(r[2]),
         "site_name":r[3],
-        "announcement":r[4]
+        "announcement":r[4],
+        "public_channels_locked":bool(r[5]),
+        "public_embeds_enabled":bool(r[6])
     }
 
 def site_permissions_for_user(uid):
@@ -2144,6 +2196,103 @@ input,textarea,select,button{max-width:100%}
   }
 }
 
+
+/* ============================================================
+   VYNTRA REACTIONS + LINK EMBEDS
+   ============================================================ */
+.reactionRow{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px;align-items:center}
+.reactionChip,.reactionAdd{min-height:26px;border-radius:9px;border:1px solid rgba(255,255,255,.08);background:#15101d;color:#ddd5e6;padding:3px 8px;display:inline-flex;align-items:center;gap:5px;cursor:pointer}
+.reactionChip span{font-size:11px;font-weight:800;color:#a89caf}
+.reactionChip.mine{background:rgba(155,77,255,.16);border-color:rgba(155,77,255,.45)}
+.reactionAdd{color:#968ba0;font-size:15px}
+.reactionPicker{display:grid;grid-template-columns:repeat(5,1fr);gap:8px}
+.reactionPicker button{height:50px;border-radius:13px;background:#181120;border:1px solid rgba(255,255,255,.07);font-size:22px}
+.linkEmbed{display:block;margin-top:8px;max-width:520px;padding:10px 12px;border-radius:12px;text-decoration:none;color:inherit;background:linear-gradient(180deg,#17111f,#110d18);border-left:3px solid #9b4dff;border-top:1px solid rgba(255,255,255,.05);border-right:1px solid rgba(255,255,255,.05);border-bottom:1px solid rgba(255,255,255,.05)}
+.linkEmbed:hover{background:#1c1425}
+.linkEmbedHost{font-size:12px;font-weight:900;color:#c99cff;margin-bottom:4px}
+.linkEmbedUrl{font-size:12px;color:#9f95a8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.publicReadOnly{justify-content:center;min-height:52px}
+@media(max-width:720px){.linkEmbed{max-width:100%}.reactionPicker{grid-template-columns:repeat(3,1fr)}}
+
+
+/* ============================================================
+   VYNTRA CLICKABLE LINKS + REPLIES
+   ============================================================ */
+.messageLink{
+  color:#b57cff;
+  text-decoration:none;
+  font-weight:650;
+  word-break:break-all;
+}
+.messageLink:hover{
+  text-decoration:underline;
+}
+.replyPreview{
+  margin-bottom:6px;
+  padding:6px 9px;
+  border-left:2px solid #8051aa;
+  background:rgba(155,77,255,.055);
+  border-radius:0 8px 8px 0;
+  cursor:pointer;
+  max-width:560px;
+}
+.replyName{
+  font-size:11px;
+  font-weight:900;
+  color:#c798ff;
+  margin-bottom:2px;
+}
+.replyText{
+  font-size:12px;
+  color:#92899b;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.replyBar{
+  margin:0 18px -7px;
+  padding:8px 10px;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  border:1px solid rgba(155,77,255,.20);
+  border-bottom:0;
+  border-radius:13px 13px 0 0;
+  background:#16101e;
+}
+.replyBarText{
+  min-width:0;
+  flex:1;
+  display:flex;
+  flex-direction:column;
+}
+.replyBarText b{
+  font-size:11px;
+  color:#c799ff;
+}
+.replyBarText span{
+  font-size:11px;
+  color:#89818f;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+}
+.replyFlash{
+  animation:vyntraReplyFlash 1.2s ease!important;
+}
+@keyframes vyntraReplyFlash{
+  0%,100%{background:transparent}
+  25%,65%{background:rgba(155,77,255,.14)}
+}
+body.theme-light .replyBar{
+  background:#f2edf6;
+}
+@media(max-width:720px){
+  .replyBar{
+    margin:0 8px -5px;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -2156,10 +2305,24 @@ input,textarea,select,button{max-width:100%}
 const state={
  me:null, profile:null, view:"public", channel:"chat1", messages:[],
  servers:[], activeServer:null, serverInfo:null, serverMembers:[],serverChannels:[],serverRoles:[],
- activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0
+ activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
+
+function linkifyText(raw){
+ const safe=esc(raw||"");
+ return safe.replace(/https?:\/\/[^\s<]+/g,(full)=>{
+   let url=full;
+   let tail="";
+   while(/[.,!?;:)\]]$/.test(url)){
+     tail=url.slice(-1)+tail;
+     url=url.slice(0,-1);
+   }
+   return `<a class="messageLink" href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>${tail}`;
+ });
+}
+
 const roleRank=r=>({user:0,member:0,moderator:1,admin:2,owner:3}[r]??0);
 function hasServerPerm(permission){
   if(!state.serverInfo) return false;
@@ -2190,6 +2353,7 @@ async function loadSiteStatus(){
    if(s.announcement){
      siteBanner.innerHTML=`<div style="position:fixed;left:50%;transform:translateX(-50%);top:10px;z-index:300;background:#1a1224;border:1px solid #7144a0;color:#eee;padding:9px 14px;border-radius:12px;box-shadow:0 10px 40px #0008;max-width:min(700px,90vw);text-align:center">${esc(s.announcement)}</div>`;
    }else siteBanner.innerHTML="";
+   window._siteStatus=s;
    return s;
  }catch(e){return null}
 }
@@ -2339,7 +2503,7 @@ function renderChat(){
  const title=state.view==="public"?(state.channel==="chat1"?"# Chat 1":"# Chat 2"):"Chat";
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${notificationBellButton()}</div></header>
  <div class="content"><div id="messageList" class="messages"></div></div>
- <div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
+ ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
  appShell.classList.remove("with-members");
  loadMessages();
  state.poll=setInterval(loadMessages,1200);
@@ -2360,12 +2524,12 @@ function drawMessages(){
  const el=document.getElementById("messageList");if(!el)return;
  const near=el.scrollHeight-el.scrollTop-el.clientHeight<130;
  if(!state.messages.length){el.innerHTML=`<div class="empty">No messages here yet.<br>Be the first to say something.</div>`;return}
- el.innerHTML=state.messages.map(m=>`<div class="msg" oncontextmenu="messageMenu(event,${m.id})">
+ el.innerHTML=state.messages.map(m=>`<div class="msg" id="message-${m.id}" oncontextmenu="messageMenu(event,${m.id})">
    <img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'">
    <div class="msgBody"><div class="meta"><span class="name">${esc(m.username)}</span>
    ${m.is_spookhook?`<span class="roleTag">VYNTRAHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:"")}
    <span class="time">${new Date(m.created_at).toLocaleString([], {hour:'2-digit',minute:'2-digit'})}</span>
-   ${m.edited_at?`<span class="edited">(edited)</span>`:""}</div><div class="text">${esc(m.content)}</div></div>
+   ${m.edited_at?`<span class="edited">(edited)</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}<div class="text">${linkifyText(m.content)}</div>${renderLinkEmbed(m)}${renderReactions(m)}</div>
  </div>`).join("");
  if(near)el.scrollTop=el.scrollHeight;
 }
@@ -2377,6 +2541,77 @@ async function sendMessage(){
  else {b.kind="dm";b.chat_id=state.activeChat}
  try{await api("/api/messages",{method:"POST",body:JSON.stringify(b)});inp.value="";await loadMessages()}catch(e){toast(e.message)}
 }
+
+const REACTION_CHOICES=["👍","❤️","😂","🔥","🎉","👻","💜","✅","❌"];
+
+function renderReactions(m){
+ const current=(m.reactions||[]).map(r=>`<button class="reactionChip ${r.mine?"mine":""}" onclick="toggleReaction(${m.id},'${r.emoji}')">${r.emoji}<span>${r.count}</span></button>`).join("");
+ return `<div class="reactionRow">${current}<button class="reactionAdd" onclick="showReactionPicker(${m.id})">＋</button></div>`;
+}
+
+function renderLinkEmbed(m){
+ if(!m.embed_url||!m.embed_allowed)return "";
+ try{
+   const u=new URL(m.embed_url);
+   return `<a class="linkEmbed" href="${esc(m.embed_url)}" target="_blank" rel="noopener noreferrer"><div class="linkEmbedHost">${esc(u.hostname)}</div><div class="linkEmbedUrl">${esc(m.embed_url)}</div></a>`;
+ }catch(e){
+   return "";
+ }
+}
+
+function showReactionPicker(mid){
+ modalOpen("React to message",`<div class="reactionPicker">${REACTION_CHOICES.map(e=>`<button onclick="toggleReaction(${mid},'${e}');modalClose()">${e}</button>`).join("")}</div>`);
+}
+
+async function toggleReaction(mid,emoji){
+ try{
+   await api(`/api/messages/${mid}/reaction`,{
+     method:"POST",
+     body:JSON.stringify({emoji})
+   });
+
+   if(state.view==="dm")await loadChatMessages();
+   else await loadMessages();
+
+ }catch(e){
+   toast(e.message);
+ }
+}
+
+
+
+function startReply(mid){
+ const m=(window._lastMessages||[]).find(x=>Number(x.id)===Number(mid));
+ if(!m)return;
+ state.replyingTo={id:m.id,username:m.username,content:m.content};
+ renderReplyBar();
+ const input=document.getElementById("messageInput");
+ if(input)input.focus();
+}
+function cancelReply(){
+ state.replyingTo=null;
+ renderReplyBar();
+}
+function renderReplyBar(){
+ const old=document.getElementById("replyBar");
+ if(old)old.remove();
+ if(!state.replyingTo)return;
+ const composer=document.querySelector(".composer");
+ if(!composer)return;
+ const bar=document.createElement("div");
+ bar.id="replyBar";
+ bar.className="replyBar";
+ bar.innerHTML=`<div class="replyBarText"><b>Replying to ${esc(state.replyingTo.username)}</b><span>${esc(state.replyingTo.content.slice(0,120))}</span></div><button type="button" class="roundBtn" onclick="cancelReply()">×</button>`;
+ composer.parentNode.insertBefore(bar,composer);
+}
+function scrollToMessage(mid){
+ const el=document.getElementById("message-"+mid);
+ if(!el)return;
+ el.scrollIntoView({behavior:"smooth",block:"center"});
+ el.classList.add("replyFlash");
+ setTimeout(()=>el.classList.remove("replyFlash"),1200);
+}
+
 function messageMenu(ev,id){
  ev.preventDefault();ev.stopPropagation();
  const m=state.messages.find(x=>x.id===id);if(!m)return;
@@ -2385,7 +2620,7 @@ function messageMenu(ev,id){
  const serverStaff=state.view==="server"&&state.serverInfo&&["moderator","admin","owner"].includes(state.serverInfo.my_role);
  const canDelete=mine||globalStaff||serverStaff;
  overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-260)}px" onclick="event.stopPropagation()">
- <button onclick="viewProfile(${m.user_id});closeContext()">👤 View profile</button>
+ <button onclick="startReply(${m.id});closeContext()">↩ Reply</button><button onclick="viewProfile(${m.user_id});closeContext()">👤 View profile</button>
  <button onclick="navigator.clipboard.writeText(${JSON.stringify(m.content)});toast('Copied');closeContext()">📋 Copy message</button>
  <button onclick="reportMessage(${m.id});closeContext()">🚩 Report message</button>
  ${mine?`<button onclick="editMessagePrompt(${m.id});closeContext()">✏️ Edit message</button>`:""}
@@ -2681,6 +2916,8 @@ const SERVER_PERMISSION_LABELS={
  mute_members:["Mute Members","Can restrict members from talking."],
  ban_members:["Ban Members","Can ban and unban members."],
  manage_messages:["Manage Messages","Can delete other members' messages."],
+ embed_links:["Embed Links","Allows links to appear as preview cards in server channels."],
+ add_reactions:["Add Reactions","Allows reacting to messages with emoji."],
  manage_spookhooks:["Manage VyntraHooks","Can create and delete VyntraHooks."],
  manage_server:["Manage Server","Can change server name, icon, and privacy. Cannot delete the server."]
 };
@@ -2826,6 +3063,11 @@ async function loadOwnerDashboard(){
      <label class="row"><input id="ownerMaintenance" type="checkbox" ${s.maintenance_mode?"checked":""}> <div><div class="listTitle">Maintenance Mode</div><div class="listSub">Normal users are blocked while you can still access Owner controls.</div></div></label>
      <div class="label">Maintenance message</div><textarea id="ownerMaintenanceMessage" class="field" rows="3">${esc(s.maintenance_message)}</textarea>
      <label class="row"><input id="ownerRegistrations" type="checkbox" ${s.registrations_enabled?"checked":""}> <div><div class="listTitle">Allow New Registrations</div><div class="listSub">Turn off to stop new account creation.</div></div></label>
+
+     <label class="row"><input id="ownerPublicLock" type="checkbox" ${s.public_channels_locked?"checked":""}> <div><div class="listTitle">Lock Public Channels</div><div class="listSub">When enabled, normal users and moderators can read but only global Admin and Owner can post.</div></div></label>
+
+     <label class="row"><input id="ownerPublicEmbeds" type="checkbox" ${s.public_embeds_enabled?"checked":""}> <div><div class="listTitle">Public Chat Link Embeds</div><div class="listSub">Controls preview cards in public chats. Links themselves are always clickable.</div></div></label>
+
      <div class="label">Site name</div><input id="ownerSiteName" class="field" value="${esc(s.site_name)}">
      <button class="danger" onclick="confirmMaintenanceToggle()">${s.maintenance_mode?"Disable Maintenance Mode":"Enable Maintenance Mode"}</button>
      <button class="primary" onclick="saveOwnerSettings()">Save Site Settings</button>
@@ -2847,6 +3089,8 @@ async function saveOwnerSettings(){
      maintenance_mode:ownerMaintenance.checked,
      maintenance_message:ownerMaintenanceMessage.value,
      registrations_enabled:ownerRegistrations.checked,
+     public_channels_locked:ownerPublicLock.checked,
+     public_embeds_enabled:ownerPublicEmbeds.checked,
      site_name:ownerSiteName.value,
      announcement:ownerAnnouncement.value
    })});
@@ -3131,7 +3375,9 @@ def site_status():
         maintenance_message=s["maintenance_message"],
         registrations_enabled=s["registrations_enabled"],
         site_name=s["site_name"],
-        announcement=s["announcement"]
+        announcement=s["announcement"],
+        public_channels_locked=s["public_channels_locked"],
+        public_embeds_enabled=s["public_embeds_enabled"]
     )
 
 @app.post("/api/register")
@@ -4232,12 +4478,69 @@ def messages_get():
               from messages m join users u on u.id=m.user_id
               where m.kind='dm' and m.chat_id=%s order by m.created_at desc limit 150
             """,(cid,)).fetchall()
-    return jsonify(messages=[
-      {"id":r[0],"user_id":r[1],"content":r[2],"created_at":r[3].isoformat(),
-       "edited_at":r[4].isoformat() if r[4] else None,"username":r[5],"avatar":r[6],"role":r[7],
-       "is_spookhook":bool(r[8]) if len(r)>8 else False}
-      for r in reversed(rows)
-    ])
+    ordered=list(reversed(rows))
+    message_ids=[r[0] for r in ordered]
+    reaction_map={}
+
+    if message_ids:
+        with connect() as rc:
+            rr=rc.execute("""
+                select message_id,emoji,count(*),bool_or(user_id=%s)
+                from message_reactions
+                where message_id=any(%s)
+                group by message_id,emoji
+                order by emoji
+            """,(request.me["id"],message_ids)).fetchall()
+
+        for mid,emoji,count,mine in rr:
+            reaction_map.setdefault(mid,[]).append({
+                "emoji":emoji,
+                "count":count,
+                "mine":bool(mine)
+            })
+
+    payload=[]
+    for r in ordered:
+        item={
+            "id":r[0],
+            "user_id":r[1],
+            "content":r[2],
+            "created_at":r[3].isoformat(),
+            "edited_at":r[4].isoformat() if r[4] else None,
+            "username":r[5],
+            "avatar":r[6],
+            "role":r[7],
+            "is_spookhook":bool(r[8]) if len(r)>8 else False,
+            "reactions":reaction_map.get(r[0],[]),
+            "embed_url":extract_first_url(r[2]),
+            "embed_allowed":True,
+            "reply":None
+        }
+
+        reply_row=None
+        with connect() as rr_conn:
+            reply_row=rr_conn.execute("""
+                select m.id,m.content,u.username
+                from messages m
+                join users u on u.id=m.user_id
+                where m.id=(select reply_to_id from messages where id=%s)
+            """,(r[0],)).fetchone()
+
+        if reply_row:
+            item["reply"]={
+                "id":reply_row[0],
+                "content":reply_row[1][:180],
+                "username":reply_row[2]
+            }
+
+        if kind=="server" and sid:
+            item["embed_allowed"]=message_embed_allowed(kind,sid,r[1])
+        elif kind=="public":
+            item["embed_allowed"]=get_site_settings()["public_embeds_enabled"]
+
+        payload.append(item)
+
+    return jsonify(messages=payload)
 
 @app.post("/api/messages")
 @login_required
@@ -4246,7 +4549,18 @@ def messages_post():
     content=str(d.get("content","")).strip();kind=d.get("kind")
     if not content or len(content)>4000 or kind not in ("public","server","dm"):
         return jsonify(error="Invalid message"),400
+
+    if kind=="public":
+        public_settings=get_site_settings()
+        if public_settings["public_channels_locked"] and request.me["global_role"] not in ("admin","owner"):
+            return jsonify(error="Public channels are currently locked. Only VYNTRA Admins and Owner can post."),403
+
     channel=d.get("channel");sid=d.get("server_id");cid=d.get("chat_id")
+    reply_to_id=d.get("reply_to_id")
+    try:
+        reply_to_id=int(reply_to_id) if reply_to_id else None
+    except Exception:
+        reply_to_id=None
     if kind=="public" and channel not in ("chat1","chat2"):
         return jsonify(error="Invalid public channel"),400
     if kind=="server":
@@ -4264,10 +4578,26 @@ def messages_post():
             if not c.execute("select 1 from chat_members where chat_id=%s and user_id=%s",(cid,request.me["id"])).fetchone():
                 return jsonify(error="Not a chat member"),403
     with connect() as c:
+        if reply_to_id:
+            reply=c.execute("""
+                select kind,channel,server_id,chat_id
+                from messages where id=%s
+            """,(reply_to_id,)).fetchone()
+            if not reply:
+                reply_to_id=None
+            elif reply[0] != kind:
+                return jsonify(error="You can only reply to a message in the same conversation."),400
+            elif kind=="public" and reply[1] != channel:
+                return jsonify(error="Reply target is not in this public channel."),400
+            elif kind=="server" and (reply[2] != sid or str(reply[1]) != str(channel)):
+                return jsonify(error="Reply target is not in this server channel."),400
+            elif kind=="dm" and reply[3] != cid:
+                return jsonify(error="Reply target is not in this chat."),400
+
         mid=c.execute("""
-          insert into messages(user_id,content,kind,channel,server_id,chat_id)
-          values(%s,%s,%s,%s,%s,%s) returning id
-        """,(request.me["id"],content,kind,channel,sid,cid)).fetchone()[0]
+          insert into messages(user_id,content,kind,channel,server_id,chat_id,reply_to_id)
+          values(%s,%s,%s,%s,%s,%s,%s) returning id
+        """,(request.me["id"],content,kind,channel,sid,cid,reply_to_id)).fetchone()[0]
 
         if kind=="dm" and cid:
             chat=c.execute("select kind,name from chats where id=%s",(cid,)).fetchone()
@@ -4286,6 +4616,51 @@ def messages_post():
 
         c.commit()
     return jsonify(id=mid)
+
+
+@app.post("/api/messages/<int:mid>/reaction")
+@login_required
+def message_reaction_toggle(mid):
+    d=request.get_json(silent=True) or {}
+    emoji=str(d.get("emoji","")).strip()[:16]
+    allowed_emojis={"👍","❤️","😂","🔥","🎉","👻","💜","✅","❌"}
+
+    if emoji not in allowed_emojis:
+        return jsonify(error="Invalid reaction"),400
+
+    with connect() as c:
+        m=c.execute("select kind,server_id from messages where id=%s",(mid,)).fetchone()
+        if not m:
+            return jsonify(error="Message not found"),404
+
+        if m[0]=="server":
+            sid=m[1]
+            if not server_member(sid,request.me["id"]):
+                return jsonify(error="Not a server member"),403
+            if not has_server_permission(sid,request.me["id"],"add_reactions"):
+                return jsonify(error="Add Reactions permission required"),403
+
+        existing=c.execute("""
+            select 1 from message_reactions
+            where message_id=%s and user_id=%s and emoji=%s
+        """,(mid,request.me["id"],emoji)).fetchone()
+
+        if existing:
+            c.execute("""
+                delete from message_reactions
+                where message_id=%s and user_id=%s and emoji=%s
+            """,(mid,request.me["id"],emoji))
+            added=False
+        else:
+            c.execute("""
+                insert into message_reactions(message_id,user_id,emoji)
+                values(%s,%s,%s)
+            """,(mid,request.me["id"],emoji))
+            added=True
+
+        c.commit()
+
+    return jsonify(ok=True,added=added)
 
 @app.patch("/api/messages/<int:mid>")
 @login_required
@@ -4441,13 +4816,17 @@ def owner_site_settings():
     msg=str(d.get("maintenance_message",current["maintenance_message"]))[:500]
     site_name=str(d.get("site_name",current["site_name"])).strip()[:60] or "VYNTRA"
     announcement=str(d.get("announcement",current["announcement"]))[:500]
+    public_channels_locked=bool(d.get("public_channels_locked",current["public_channels_locked"]))
+    public_embeds_enabled=bool(d.get("public_embeds_enabled",current["public_embeds_enabled"]))
     with connect() as c:
         c.execute("""
             update site_settings
             set maintenance_mode=%s,maintenance_message=%s,registrations_enabled=%s,
-                site_name=%s,announcement=%s,updated_at=now()
+                site_name=%s,announcement=%s,public_channels_locked=%s,
+                public_embeds_enabled=%s,updated_at=now()
             where id=1
-        """,(maintenance,msg,registrations,site_name,announcement))
+        """,(maintenance,msg,registrations,site_name,announcement,
+             public_channels_locked,public_embeds_enabled))
         c.commit()
     audit_owner_action(request.me["id"],"update_site_settings","site","1",
                        f"maintenance={maintenance}, registrations={registrations}")
