@@ -740,7 +740,7 @@ HTML = r"""
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
 <title>VYNTRA</title>
 <link rel="icon" type="image/png" href="/static/spookchat_pfp.png">
 <style>
@@ -1966,6 +1966,183 @@ body.theme-light input[type="checkbox"]{background:#f3eff7;border-color:#cfc5d8}
 .maintenanceCard p{color:#a49baa;font-size:15px;line-height:1.55;white-space:pre-wrap}
 .maintenanceActions{display:flex;justify-content:center;gap:9px;margin-top:22px}
 @media(max-width:720px){.maintenanceCard{padding:28px 20px}.maintenanceCard h1{font-size:27px}.modalHeader{top:-18px}}
+
+
+/* ============================================================
+   VYNTRA PHONE / TABLET AUTO-FIT
+   Fits the UI to the device viewport without browser zoom hacks.
+   ============================================================ */
+html{
+  width:100%;
+  height:100%;
+  -webkit-text-size-adjust:100%;
+  text-size-adjust:100%;
+  overflow:hidden;
+}
+body{
+  width:100%;
+  min-width:0;
+  height:100%;
+  min-height:100dvh;
+  margin:0;
+  overflow:hidden;
+}
+*,*::before,*::after{box-sizing:border-box}
+img,video,canvas,svg{max-width:100%}
+input,textarea,select,button{max-width:100%}
+
+@media (max-width:1100px){
+  :root{
+    --mobile-side-gap: clamp(8px,2.4vw,18px);
+  }
+
+  body{
+    min-width:0!important;
+    width:100vw!important;
+    max-width:100vw!important;
+  }
+
+  .app,.app.with-members{
+    width:100%!important;
+    max-width:100vw!important;
+    min-width:0!important;
+  }
+
+  .main,#mainArea,.content,.page,.serverWorkspace,.serverConversation{
+    min-width:0!important;
+    max-width:100%!important;
+  }
+
+  .page{
+    width:100%!important;
+    overflow-x:hidden!important;
+  }
+
+  .card,.listItem,.formGrid,.grid2,.searchBox{
+    min-width:0!important;
+    max-width:100%!important;
+  }
+
+  input,textarea,select{
+    min-width:0!important;
+    width:100%;
+  }
+
+  .topbar{
+    width:100%!important;
+    max-width:100vw!important;
+  }
+
+  .modal{
+    width:min(94vw,680px)!important;
+    max-width:calc(100vw - 16px)!important;
+  }
+}
+
+/* Phones */
+@media (max-width:720px){
+  html,body{
+    width:100%!important;
+    max-width:100%!important;
+    min-width:0!important;
+    overflow-x:hidden!important;
+  }
+
+  .app,.app.with-members{
+    width:100vw!important;
+    max-width:100vw!important;
+    min-width:0!important;
+    height:calc(100dvh - 78px)!important;
+    max-height:calc(100dvh - 78px)!important;
+  }
+
+  .topbar{
+    padding-left:max(10px,env(safe-area-inset-left))!important;
+    padding-right:max(10px,env(safe-area-inset-right))!important;
+  }
+
+  .page{
+    padding-left:max(10px,env(safe-area-inset-left))!important;
+    padding-right:max(10px,env(safe-area-inset-right))!important;
+    padding-bottom:94px!important;
+  }
+
+  .mobilebar{
+    left:max(7px,env(safe-area-inset-left))!important;
+    right:max(7px,env(safe-area-inset-right))!important;
+    bottom:max(6px,env(safe-area-inset-bottom))!important;
+  }
+
+  .serverChannelButtons{
+    max-width:100vw!important;
+  }
+
+  .composer{
+    max-width:calc(100vw - 16px)!important;
+  }
+
+  .msgBody{
+    min-width:0!important;
+    max-width:calc(100vw - 62px)!important;
+  }
+
+  .text,.listTitle,.listSub,.muted{
+    overflow-wrap:anywhere;
+    word-break:break-word;
+  }
+
+  .modalWrap{
+    width:100vw!important;
+    max-width:100vw!important;
+  }
+
+  .modal{
+    width:100%!important;
+    max-width:100%!important;
+    max-height:88dvh!important;
+  }
+
+  /* Prevent iOS from zooming the whole page when focusing form fields. */
+  input,textarea,select{
+    font-size:16px!important;
+  }
+}
+
+/* Small phones */
+@media (max-width:390px){
+  .topTitle{font-size:14px!important}
+  .pageHero h1{font-size:20px!important}
+  .card{padding:11px!important}
+  .mobilebar{height:62px!important}
+  .mobilebar button{height:51px!important}
+  .mobileNavOrb{width:34px!important;height:34px!important}
+}
+
+/* Tablets: use the available width rather than oversized desktop sizing. */
+@media (min-width:721px) and (max-width:1100px){
+  .sidebar{
+    width:220px!important;
+    flex-basis:220px!important;
+  }
+
+  .membersPane{
+    width:220px!important;
+    flex-basis:220px!important;
+  }
+
+  .page{
+    padding:18px!important;
+  }
+
+  .grid2{
+    gap:12px!important;
+  }
+
+  .serverChannelRail{
+    width:170px!important;
+    flex-basis:170px!important;
+  }
+}
 
 </style>
 </head>
