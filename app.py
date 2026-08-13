@@ -3,6 +3,7 @@ import secrets
 import hashlib
 import html as html_lib
 import re as re_lib
+import time
 from datetime import datetime, timezone, timedelta
 from functools import wraps
 
@@ -220,6 +221,17 @@ create table if not exists messages(
 );
 
 
+
+create table if not exists typing_status(
+ user_id bigint not null references users(id) on delete cascade,
+ scope_key text not null,
+ expires_at timestamptz not null,
+ primary key(user_id,scope_key)
+);
+
+create index if not exists typing_status_scope_idx
+on typing_status(scope_key,expires_at);
+
 create table if not exists message_reactions(
  message_id bigint not null references messages(id) on delete cascade,
  user_id bigint not null references users(id) on delete cascade,
@@ -267,6 +279,7 @@ on notifications(user_id,read_at,created_at);
 create index if not exists messages_public_idx on messages(kind,channel,created_at);
 create index if not exists messages_server_idx on messages(server_id,channel,created_at);
 create index if not exists messages_chat_idx on messages(chat_id,created_at);
+create index if not exists messages_reply_idx on messages(reply_to_id);
 """
 
 def connect():
@@ -326,6 +339,7 @@ def init_db():
             c.execute("alter table messages add column if not exists is_spookhook boolean not null default false")
             c.execute("alter table messages add column if not exists hook_name text not null default ''")
             c.execute("alter table messages add column if not exists reply_to_id bigint references messages(id) on delete set null")
+            c.execute("create index if not exists messages_reply_idx on messages(reply_to_id)")
 
             c.execute("alter table server_roles add column if not exists permissions jsonb not null default '{}'::jsonb")
             c.execute("""
@@ -377,6 +391,17 @@ def init_db():
                 )
             """)
             c.execute("create index if not exists message_reactions_message_idx on message_reactions(message_id)")
+
+            c.execute("""
+                create table if not exists typing_status(
+                 user_id bigint not null references users(id) on delete cascade,
+                 scope_key text not null,
+                 expires_at timestamptz not null,
+                 primary key(user_id,scope_key)
+                )
+            """)
+            c.execute("create index if not exists typing_status_scope_idx on typing_status(scope_key,expires_at)")
+
 
             c.execute("alter table reports add column if not exists status text not null default 'open'")
             c.execute("alter table reports add column if not exists created_at timestamptz not null default now()")
@@ -487,6 +512,29 @@ def message_embed_allowed(kind, sid, uid):
     return has_server_permission(sid, uid, "embed_links")
 
 
+
+ONLINE_SECONDS = 75
+
+def presence_payload(last_seen):
+    if not last_seen:
+        return {"online":False,"last_seen":None}
+
+    now=datetime.now(timezone.utc)
+    return {
+        "online":(now-last_seen).total_seconds() <= ONLINE_SECONDS,
+        "last_seen":last_seen.isoformat()
+    }
+
+def typing_scope_key(kind,channel=None,server_id=None,chat_id=None):
+    if kind=="public":
+        return f"public:{str(channel)[:80]}"
+    if kind=="server":
+        return f"server:{int(server_id)}:{str(channel)[:80]}"
+    if kind=="dm":
+        return f"dm:{int(chat_id)}"
+    return ""
+
+
 def client_ip():
     # Vercel supplies x-forwarded-for. We only use the first IP inserted by the edge.
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -511,14 +559,32 @@ def current_user():
     uid = session.get("uid")
     return row_user(uid) if uid else None
 
+_IP_BAN_CACHE = {}
+
+def clear_ip_ban_cache():
+    _IP_BAN_CACHE.clear()
+
 def ip_is_banned(ip):
     if not ip:
         return False
+
+    now=time.monotonic()
+    cached=_IP_BAN_CACHE.get(ip)
+    if cached and now-cached[0]<5:
+        return cached[1]
+
     with connect() as c:
-        r = c.execute("select banned_until from ip_bans where ip=%s", (ip,)).fetchone()
-    if not r:
-        return False
-    return r[0] is None or r[0] > datetime.now(timezone.utc)
+        r=c.execute("select banned_until from ip_bans where ip=%s",(ip,)).fetchone()
+
+    banned=bool(r and (r[0] is None or r[0]>datetime.now(timezone.utc)))
+    _IP_BAN_CACHE[ip]=(now,banned)
+
+    # Keep cache tiny.
+    if len(_IP_BAN_CACHE)>200:
+        _IP_BAN_CACHE.clear()
+
+    return banned
+
 
 def login_required(fn):
     @wraps(fn)
@@ -538,9 +604,16 @@ def login_required(fn):
         if u["banned_until"] and u["banned_until"] > datetime.now(timezone.utc):
             return jsonify(error="Your account is temporarily banned."), 403
         try:
-            with connect() as c:
-                c.execute("update users set last_ip=%s,device_type=%s,last_seen=now() where id=%s", (client_ip(), device_type(), u["id"]))
-                c.commit()
+            now_ts=int(time.time())
+            last_write=int(session.get("_presence_write",0) or 0)
+            if now_ts-last_write>=60:
+                with connect() as c:
+                    c.execute(
+                        "update users set last_ip=%s,device_type=%s,last_seen=now() where id=%s",
+                        (client_ip(),device_type(),u["id"])
+                    )
+                    c.commit()
+                session["_presence_write"]=now_ts
         except Exception:
             pass
         request.me = u
@@ -693,9 +766,67 @@ def server_custom_roles(sid, uid):
         """,(sid,uid)).fetchall()
     return {f"custom:{r[0]}" for r in rows}
 
+def channel_effective_permissions(sid,channel_id,uid):
+    """Return (server_member_dict, effective_permission_set) using one DB connection."""
+    with connect() as c:
+        sm_row=c.execute("""
+            select role,banned_until,muted_until,joined_at
+            from server_members
+            where server_id=%s and user_id=%s
+        """,(sid,uid)).fetchone()
+
+        if not sm_row:
+            return None,set()
+
+        sm={
+            "role":sm_row[0],
+            "banned_until":sm_row[1],
+            "muted_until":sm_row[2],
+            "joined_at":sm_row[3]
+        }
+
+        if sm["role"]=="owner":
+            return sm,set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)|{"delete_server"}
+
+        role_rows=c.execute("""
+            select sr.id,sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,uid)).fetchall()
+
+        override_rows=c.execute("""
+            select role_key,allow_permissions,deny_permissions
+            from channel_role_overrides
+            where channel_id=%s
+        """,(channel_id,)).fetchall()
+
+    perms=set(BUILTIN_SERVER_PERMISSIONS.get(sm["role"],set()))
+    role_keys={sm["role"]}
+
+    for rid,raw in role_rows:
+        role_keys.add(f"custom:{rid}")
+        rp=normalize_permissions(raw)
+        if "administrator" in rp:
+            perms|=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)
+        perms|=(rp-{"administrator"})
+
+    allow=set()
+    deny=set()
+    for role_key,allowed,denied in override_rows:
+        if role_key not in role_keys:
+            continue
+        allow|=set(allowed or [])
+        deny|=set(denied or [])
+
+    perms-=deny
+    perms|=allow
+    return sm,perms
+
 def channel_access(sid, channel_id, uid, mode):
-    permission = "view_channels" if mode == "view" else "send_messages"
-    return channel_permission(sid, channel_id, uid, permission)
+    permission="view_channels" if mode=="view" else "send_messages"
+    _,perms=channel_effective_permissions(sid,channel_id,uid)
+    return permission in perms
 
 
 
@@ -709,15 +840,27 @@ SITE_ROLE_PERMISSION_KEYS = [
     "view_audit_log"
 ]
 
-def get_site_settings():
+_SITE_SETTINGS_CACHE = {"at":0.0,"value":None}
+
+def clear_site_settings_cache():
+    _SITE_SETTINGS_CACHE["at"]=0.0
+    _SITE_SETTINGS_CACHE["value"]=None
+
+def get_site_settings(force=False):
+    now=time.monotonic()
+    cached=_SITE_SETTINGS_CACHE.get("value")
+    if not force and cached is not None and now-_SITE_SETTINGS_CACHE.get("at",0)<5:
+        return dict(cached)
+
     with connect() as c:
         r=c.execute("""
             select maintenance_mode,maintenance_message,registrations_enabled,site_name,announcement,
                    public_channels_locked,public_embeds_enabled
             from site_settings where id=1
         """).fetchone()
+
     if not r:
-        return {
+        value={
             "maintenance_mode":False,
             "maintenance_message":"VYNTRA is temporarily under maintenance.",
             "registrations_enabled":True,
@@ -726,15 +869,21 @@ def get_site_settings():
             "public_channels_locked":False,
             "public_embeds_enabled":True
         }
-    return {
-        "maintenance_mode":bool(r[0]),
-        "maintenance_message":r[1],
-        "registrations_enabled":bool(r[2]),
-        "site_name":r[3],
-        "announcement":r[4],
-        "public_channels_locked":bool(r[5]),
-        "public_embeds_enabled":bool(r[6])
-    }
+    else:
+        value={
+            "maintenance_mode":bool(r[0]),
+            "maintenance_message":r[1],
+            "registrations_enabled":bool(r[2]),
+            "site_name":r[3],
+            "announcement":r[4],
+            "public_channels_locked":bool(r[5]),
+            "public_embeds_enabled":bool(r[6])
+        }
+
+    _SITE_SETTINGS_CACHE["at"]=now
+    _SITE_SETTINGS_CACHE["value"]=dict(value)
+    return value
+
 
 def site_permissions_for_user(uid):
     u=row_user(uid)
@@ -2293,6 +2442,99 @@ body.theme-light .replyBar{
   }
 }
 
+
+/* ============================================================
+   VYNTRA PERFORMANCE UI
+   ============================================================ */
+.msg.sending{
+  opacity:.68;
+}
+.msg.sending .text{
+  transition:opacity .15s ease;
+}
+
+
+/* ============================================================
+   VYNTRA TYPING + PRESENCE
+   ============================================================ */
+
+.typingIndicator{
+  min-height:24px;
+  margin:0 20px -3px;
+  padding:4px 8px;
+  display:flex;
+  align-items:center;
+  gap:7px;
+  color:#958a9e;
+  font-size:11px;
+  font-weight:700;
+}
+
+.typingDots{
+  display:inline-flex;
+  gap:3px;
+  align-items:center;
+}
+
+.typingDots i{
+  width:4px;
+  height:4px;
+  border-radius:50%;
+  background:#a855f7;
+  animation:vyntraTyping 1s infinite ease-in-out;
+}
+
+.typingDots i:nth-child(2){
+  animation-delay:.14s;
+}
+
+.typingDots i:nth-child(3){
+  animation-delay:.28s;
+}
+
+@keyframes vyntraTyping{
+  0%,60%,100%{
+    transform:translateY(0);
+    opacity:.45;
+  }
+
+  30%{
+    transform:translateY(-3px);
+    opacity:1;
+  }
+}
+
+.presenceLine{
+  display:flex;
+  align-items:center;
+  gap:7px;
+  color:#9c92a4;
+  font-size:12px;
+  margin-top:4px;
+}
+
+.presenceDot{
+  width:9px;
+  height:9px;
+  min-width:9px;
+  border-radius:50%;
+}
+
+.presenceDot.online{
+  background:#4ade80;
+  box-shadow:0 0 10px rgba(74,222,128,.5);
+}
+
+.presenceDot.offline{
+  background:#625c68;
+}
+
+@media(max-width:720px){
+  .typingIndicator{
+    margin:0 10px -2px;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -2305,7 +2547,9 @@ body.theme-light .replyBar{
 const state={
  me:null, profile:null, view:"public", channel:"chat1", messages:[],
  servers:[], activeServer:null, serverInfo:null, serverMembers:[],serverChannels:[],serverRoles:[],
- activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null
+ activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null,
+ messagesLoading:false,lastMessageSignature:"",sendingMessage:false,
+ typingPoll:null,lastTypingSent:0,typingUsers:[]
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -2475,6 +2719,42 @@ function showMobileServerSheet(){
  modalOpen("Servers",`<div class="formGrid"><button class="primary" onclick="modalClose();showServerDiscovery()">Discover Servers</button><button class="ghost" onclick="modalClose();serverCreate()">Create Server</button>${state.servers.map(s=>`<button class="serverBtn" onclick="modalClose();openServer(${s.id})"><span class="serverIcon">${s.icon?`<img src="${esc(s.icon)}">`:esc(s.name[0])}</span><span class="listMain">${esc(s.name)}</span><span class="badge">${s.member_count}</span></button>`).join("")}</div>`);
 }
 
+
+function relativeLastSeen(iso){
+ if(!iso)return "Last seen unknown";
+
+ const d=new Date(iso);
+ const seconds=Math.max(
+   0,
+   Math.floor(
+     (Date.now()-d.getTime())/1000
+   )
+ );
+
+ if(seconds<60)return "Last seen just now";
+
+ const minutes=Math.floor(seconds/60);
+ if(minutes<60)return `Last seen ${minutes}m ago`;
+
+ const hours=Math.floor(minutes/60);
+ if(hours<24)return `Last seen ${hours}h ago`;
+
+ const days=Math.floor(hours/24);
+ if(days<7)return `Last seen ${days}d ago`;
+
+ return `Last seen ${d.toLocaleString()}`;
+}
+
+function presenceText(p){
+ return p?.online
+   ? "Online"
+   : relativeLastSeen(p?.last_seen);
+}
+
+function presenceDot(p){
+ return `<span class="presenceDot ${p?.online?"online":"offline"}"></span>`;
+}
+
 function notificationBellButton(){
  return `<button class="roundBtn notificationBell" onclick="showNotifications()" title="Notifications">🔔<span class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>`;
 }
@@ -2488,6 +2768,7 @@ function updateNotificationBadges(){
 
 function renderApp(){
  clearInterval(state.poll);
+ clearInterval(state.typingPoll);
  root.innerHTML=`<div id="appShell" class="app">${sidebar()}<main class="main"><div id="mainArea" style="height:100%;display:flex;flex-direction:column"></div></main><aside id="membersPane" class="membersPane"></aside></div>${mobilebar()}`;
  if(state.view==="friends")renderFriendsPage();
  else if(state.view==="settings")renderSettings();
@@ -2506,40 +2787,317 @@ function renderChat(){
  ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
  appShell.classList.remove("with-members");
  loadMessages();
- state.poll=setInterval(loadMessages,1200);
+ attachTypingListener();
+ state.poll=setInterval(loadMessages,2000);
 }
 function openPublic(c){state.view="public";state.channel=c;state.activeServer=null;state.serverInfo=null;renderApp()}
 
-async function loadMessages(){
+async function loadMessages(force=false){
+ if(state.messagesLoading)return;
+
+ const viewAtStart=state.view;
+ const channelAtStart=state.channel;
+ const serverAtStart=state.activeServer;
+ const chatAtStart=state.activeChat;
+
  try{
+   state.messagesLoading=true;
    let url;
-   if(state.view==="public")url=`/api/messages?kind=public&channel=${encodeURIComponent(state.channel)}`;
-   else if(state.view==="server")url=`/api/messages?kind=server&channel=${encodeURIComponent(state.channel)}&server_id=${state.activeServer}`;
-   else if(state.view==="dm")url=`/api/messages?kind=dm&chat_id=${state.activeChat}`;
-   else return;
-   const d=await api(url);state.messages=d.messages;drawMessages();
- }catch(e){}
+
+   if(viewAtStart==="public"){
+     url=`/api/messages?kind=public&channel=${encodeURIComponent(channelAtStart)}`;
+   }else if(viewAtStart==="server"){
+     url=`/api/messages?kind=server&channel=${encodeURIComponent(channelAtStart)}&server_id=${serverAtStart}`;
+   }else if(viewAtStart==="dm"){
+     url=`/api/messages?kind=dm&chat_id=${chatAtStart}`;
+   }else{
+     return;
+   }
+
+   const d=await api(url);
+
+   // Never let an old background request repaint a page
+   // after the user already navigated somewhere else.
+   if(
+     state.view!==viewAtStart ||
+     state.channel!==channelAtStart ||
+     state.activeServer!==serverAtStart ||
+     state.activeChat!==chatAtStart
+   ){
+     return;
+   }
+
+   const messages=d.messages||[];
+
+   const sig=messages.map(m=>[
+     m.id,
+     m.edited_at||"",
+     m.content,
+     (m.reactions||[]).map(r=>`${r.emoji}:${r.count}:${r.mine?1:0}`).join(","),
+     m.reply?.id||0
+   ].join("|")).join("~");
+
+   state.messages=messages;
+   window._lastMessages=messages;
+
+   if(force||sig!==state.lastMessageSignature){
+     state.lastMessageSignature=sig;
+     drawMessages();
+   }
+ }catch(e){
+ }finally{
+   state.messagesLoading=false;
+ }
 }
 function drawMessages(){
  const el=document.getElementById("messageList");if(!el)return;
  const near=el.scrollHeight-el.scrollTop-el.clientHeight<130;
  if(!state.messages.length){el.innerHTML=`<div class="empty">No messages here yet.<br>Be the first to say something.</div>`;return}
- el.innerHTML=state.messages.map(m=>`<div class="msg" id="message-${m.id}" oncontextmenu="messageMenu(event,${m.id})">
+ el.innerHTML=state.messages.map(m=>`<div class="msg ${m._optimistic?"sending":""}" id="message-${m.id}" oncontextmenu="${m._optimistic?"":`messageMenu(event,${m.id})`}">
    <img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'">
    <div class="msgBody"><div class="meta"><span class="name">${esc(m.username)}</span>
    ${m.is_spookhook?`<span class="roleTag">VYNTRAHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:"")}
    <span class="time">${new Date(m.created_at).toLocaleString([], {hour:'2-digit',minute:'2-digit'})}</span>
-   ${m.edited_at?`<span class="edited">(edited)</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}<div class="text">${linkifyText(m.content)}</div>${renderLinkEmbed(m)}${renderReactions(m)}</div>
+   ${m.edited_at?`<span class="edited">(edited)</span>`:""}${m._optimistic?`<span class="edited">sending…</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}<div class="text">${linkifyText(m.content)}</div>${renderLinkEmbed(m)}${renderReactions(m)}</div>
  </div>`).join("");
  if(near)el.scrollTop=el.scrollHeight;
 }
+
+function currentTypingScope(){
+ if(state.view==="public"){
+   return {kind:"public",channel:state.channel};
+ }
+
+ if(state.view==="server"){
+   return {
+     kind:"server",
+     channel:state.channel,
+     server_id:state.activeServer
+   };
+ }
+
+ if(state.view==="dm"){
+   return {
+     kind:"dm",
+     chat_id:state.activeChat
+   };
+ }
+
+ return null;
+}
+
+function typingQuery(scope){
+ const p=new URLSearchParams();
+
+ Object.entries(scope||{}).forEach(([k,v])=>{
+   if(v!==null&&v!==undefined)p.set(k,String(v));
+ });
+
+ return p.toString();
+}
+
+async function sendTypingSignal(){
+ const scope=currentTypingScope();
+ if(!scope)return;
+
+ const now=Date.now();
+ if(now-state.lastTypingSent<1700)return;
+
+ state.lastTypingSent=now;
+
+ try{
+   await api("/api/typing",{
+     method:"POST",
+     body:JSON.stringify(scope)
+   });
+ }catch(e){}
+}
+
+async function loadTypingUsers(){
+ const scope=currentTypingScope();
+
+ if(!scope){
+   state.typingUsers=[];
+   renderTypingIndicator();
+   return;
+ }
+
+ const viewAtStart=state.view;
+ const channelAtStart=state.channel;
+ const serverAtStart=state.activeServer;
+ const chatAtStart=state.activeChat;
+
+ try{
+   const d=await api(
+     "/api/typing?"+typingQuery(scope)
+   );
+
+   if(
+     state.view!==viewAtStart ||
+     state.channel!==channelAtStart ||
+     state.activeServer!==serverAtStart ||
+     state.activeChat!==chatAtStart
+   ){
+     return;
+   }
+
+   state.typingUsers=d.typing||[];
+   renderTypingIndicator();
+
+ }catch(e){}
+}
+
+function startTypingPolling(){
+ clearInterval(state.typingPoll);
+ loadTypingUsers();
+ state.typingPoll=setInterval(
+   loadTypingUsers,
+   1500
+ );
+}
+
+function attachTypingListener(){
+ const input=document.getElementById("messageInput");
+ if(!input)return;
+
+ if(input.dataset.typingAttached==="1")return;
+ input.dataset.typingAttached="1";
+
+ input.addEventListener("input",()=>{
+   if(input.value.trim()){
+     sendTypingSignal();
+   }
+ });
+
+ startTypingPolling();
+}
+
+function renderTypingIndicator(){
+ let el=document.getElementById(
+   "typingIndicator"
+ );
+
+ const composer=document.querySelector(
+   ".composer"
+ );
+
+ if(!composer){
+   if(el)el.remove();
+   return;
+ }
+
+ if(!el){
+   el=document.createElement("div");
+   el.id="typingIndicator";
+   el.className="typingIndicator";
+   composer.parentNode.insertBefore(
+     el,
+     composer
+   );
+ }
+
+ const users=state.typingUsers||[];
+
+ if(!users.length){
+   el.classList.add("hidden");
+   el.innerHTML="";
+   return;
+ }
+
+ let label="";
+
+ if(users.length===1){
+   label=`${esc(users[0].username)} is typing`;
+ }else if(users.length===2){
+   label=`${esc(users[0].username)} and ${esc(users[1].username)} are typing`;
+ }else{
+   label=`${esc(users[0].username)}, ${esc(users[1].username)} and ${users.length-2} more are typing`;
+ }
+
+ el.classList.remove("hidden");
+
+ el.innerHTML=`
+   <span class="typingDots">
+     <i></i><i></i><i></i>
+   </span>
+   <span>${label}</span>
+ `;
+}
+
 async function sendMessage(){
- const inp=document.getElementById("messageInput");const content=inp.value.trim();if(!content)return;
- const b={content};
- if(state.view==="public"){b.kind="public";b.channel=state.channel}
- else if(state.view==="server"){b.kind="server";b.channel=state.channel;b.server_id=state.activeServer}
- else {b.kind="dm";b.chat_id=state.activeChat}
- try{await api("/api/messages",{method:"POST",body:JSON.stringify(b)});inp.value="";await loadMessages()}catch(e){toast(e.message)}
+ if(state.sendingMessage)return;
+
+ const inp=document.getElementById("messageInput");
+ if(!inp)return;
+
+ const content=inp.value.trim();
+ if(!content)return;
+
+ const b={content,reply_to_id:state.replyingTo?.id||null};
+
+ if(state.view==="public"){
+   b.kind="public";b.channel=state.channel;
+ }else if(state.view==="server"){
+   b.kind="server";b.channel=state.channel;b.server_id=state.activeServer;
+ }else{
+   b.kind="dm";b.chat_id=state.activeChat;
+ }
+
+ // Clear immediately so the interface feels instant.
+ inp.value="";
+ const originalReply=state.replyingTo;
+ state.replyingTo=null;
+ renderReplyBar();
+
+ const tempId=-Date.now();
+ const optimistic={
+   id:tempId,
+   user_id:state.profile.id,
+   content,
+   created_at:new Date().toISOString(),
+   edited_at:null,
+   username:state.profile.username,
+   avatar:state.profile.avatar,
+   role:state.profile.global_role,
+   is_spookhook:false,
+   reactions:[],
+   embed_url:"",
+   embed_allowed:false,
+   reply:originalReply?{
+     id:originalReply.id,
+     username:originalReply.username,
+     content:originalReply.content.slice(0,180)
+   }:null,
+   _optimistic:true
+ };
+
+ state.messages=[...(state.messages||[]),optimistic];
+ window._lastMessages=state.messages;
+ state.lastMessageSignature="";
+ drawMessages();
+
+ try{
+   state.sendingMessage=true;
+   await api("/api/messages",{
+     method:"POST",
+     body:JSON.stringify(b)
+   });
+
+   // Replace optimistic message with authoritative DB version.
+   await loadMessages(true);
+
+ }catch(e){
+   state.messages=(state.messages||[]).filter(m=>m.id!==tempId);
+   window._lastMessages=state.messages;
+   drawMessages();
+   inp.value=content;
+   state.replyingTo=originalReply;
+   renderReplyBar();
+   toast(e.message);
+ }finally{
+   state.sendingMessage=false;
+   inp.focus();
+ }
 }
 
 const REACTION_CHOICES=["👍","❤️","😂","🔥","🎉","👻","💜","✅","❌"];
@@ -2570,8 +3128,7 @@ async function toggleReaction(mid,emoji){
      body:JSON.stringify({emoji})
    });
 
-   if(state.view==="dm")await loadChatMessages();
-   else await loadMessages();
+   await loadMessages(true);
 
  }catch(e){
    toast(e.message);
@@ -2639,10 +3196,48 @@ async function viewProfile(uid){
  try{
    const d=await api("/api/profile/"+uid);
    const p=d.profile;
-   modalOpen("User profile",`<div class="row"><img class="avatar" style="width:72px;height:72px" src="${avatarSrc(p.avatar)}" onerror="this.style.visibility='hidden'"><div><h2 style="margin:0">${esc(p.username)}</h2><span class="pill">${esc(p.global_role)}</span> <span class="pill">${p.device_type==="Mobile"?"📱 Mobile":"🖥 PC"}</span></div></div>
-   <div class="card" style="margin-top:14px"><div class="listSub">Vyntra ID: #${p.id}</div><div class="muted" style="margin-top:8px">${esc(p.pronouns||"No pronouns set")}</div><p>${esc(p.description||"No description.")}</p><div class="muted">${esc(p.company||"")}</div></div>
-   ${Number(uid)!==Number(state.me.id)?`<div class="modalActions"><button class="primary" onclick="addFriend(${uid});modalClose()">Add friend</button><button class="ghost" onclick="startDM(${uid});modalClose()">Message</button></div>`:""}`);
- }catch(e){toast(e.message)}
+
+   modalOpen(
+     "User profile",
+     `<div class="row">
+       <img
+         class="avatar"
+         style="width:72px;height:72px"
+         src="${avatarSrc(p.avatar)}"
+         onerror="this.style.visibility='hidden'"
+       >
+       <div>
+         <h2 style="margin:0">${esc(p.username)}</h2>
+         <div class="presenceLine">
+           ${presenceDot(p)}
+           <span>${esc(presenceText(p))}</span>
+         </div>
+         <div style="margin-top:6px">
+           <span class="pill">${esc(p.global_role)}</span>
+           <span class="pill">${p.device_type==="Mobile"?"📱 Mobile":"🖥 PC"}</span>
+         </div>
+       </div>
+     </div>
+
+     <div class="card" style="margin-top:14px">
+       <div class="listSub">Vyntra ID: #${p.id}</div>
+       <div class="muted" style="margin-top:8px">${esc(p.pronouns||"No pronouns set")}</div>
+       <p>${esc(p.description||"No description.")}</p>
+       <div class="muted">${esc(p.company||"")}</div>
+     </div>
+
+     ${Number(uid)!==Number(state.me.id)
+       ?`<div class="modalActions">
+          <button class="primary" onclick="addFriend(${uid});modalClose()">Add friend</button>
+          <button class="ghost" onclick="startDM(${uid});modalClose()">Message</button>
+        </div>`
+       :""
+     }`
+   );
+
+ }catch(e){
+   toast(e.message);
+ }
 }
 
 async function showFriendsPage(){state.view="friends";state.activeServer=null;renderApp()}
@@ -2676,7 +3271,7 @@ async function renderDM(id){
  let info=await api("/api/chats/"+id);
  await markChatNotificationsRead(id);
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
- loadMessages();state.poll=setInterval(loadMessages,1200);
+ loadMessages();attachTypingListener();state.poll=setInterval(loadMessages,2000);
 }
 function groupCreate(){modalOpen("Create group chat",`<form class="formGrid" onsubmit="makeGroup(event)"><div class="label">Group name</div><input id="groupName" class="field" maxlength="50" required><div class="label">Add usernames</div><input id="groupUsers" class="field" placeholder="alex, sam, jordan"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create</button></div></form>`)}
 async function makeGroup(e){e.preventDefault();try{const d=await api("/api/groups",{method:"POST",body:JSON.stringify({name:groupName.value,usernames:groupUsers.value.split(",").map(x=>x.trim()).filter(Boolean)})});modalClose();openChat(d.chat_id)}catch(e){toast(e.message)}}
@@ -2720,7 +3315,7 @@ async function joinServer(id){
    state.servers=(await api("/api/servers")).servers;
    toast("Joined server");
    await loadServerDiscovery();
-   const oldView=state.view;renderApp();state.view=oldView;
+   if(state.view==="discover")await loadServerDiscovery();
  }catch(e){toast(e.message)}
 }
 
@@ -2750,7 +3345,7 @@ function showMobileServerActions(){
  </div>`);
 }
 function showMobileMembers(){
- const rows=state.serverMembers.map(m=>`<div class="listItem"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}</div></div><button class="ghost" onclick="viewProfile(${m.id})">Profile</button></div>`).join("");
+ const rows=state.serverMembers.map(m=>`<div class="listItem"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${m.online?"Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}</div></div><button class="ghost" onclick="viewProfile(${m.id})">Profile</button></div>`).join("");
  modalOpen(`Members · ${state.serverMembers.length}`,rows||`<div class="muted">No members.</div>`);
 }
 
@@ -2772,11 +3367,11 @@ function renderServer(){
    </div>
  </div>`;
  renderMembers();
- loadMessages();state.poll=setInterval(loadMessages,1200);
+ loadMessages();attachTypingListener();state.poll=setInterval(loadMessages,2000);
 }
 function renderMembers(){
  const p=document.getElementById("membersPane");if(!p)return;
- p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${esc(m.role)} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
+ p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${m.online?"● Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
 }
 function toggleMembers(){appShell.classList.toggle("with-members")}
 function serverMemberMenu(ev,uid){
@@ -3237,7 +3832,7 @@ async function loadNotifications(showDesktop=false){
 function startNotificationPolling(){
  clearInterval(state.notifPoll);
  loadNotifications(false);
- state.notifPoll=setInterval(()=>loadNotifications(true),2500);
+ state.notifPoll=setInterval(()=>loadNotifications(true),5000);
 }
 async function showNotifications(){
  await loadNotifications(false);
@@ -3463,7 +4058,17 @@ def profile_get(uid):
     u = row_user(uid)
     if not u:
         return jsonify(error="User not found"), 404
-    return jsonify(profile={k:u[k] for k in ["id","username","description","avatar","pronouns","company","global_role","device_type","theme","show_staff_tag"]})
+
+    profile={k:u[k] for k in [
+        "id","username","description","avatar","pronouns","company",
+        "global_role","device_type","theme","show_staff_tag"
+    ]}
+
+    presence=presence_payload(u["last_seen"])
+    profile["online"]=presence["online"]
+    profile["last_seen"]=presence["last_seen"]
+
+    return jsonify(profile=profile)
 
 @app.patch("/api/profile")
 @login_required
@@ -3889,17 +4494,32 @@ def server_members_get(sid):
     if not sm:return jsonify(error="Not a server member"),403
     with connect() as c:
         rows=c.execute("""
-            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until,u.device_type
+            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until,
+                   u.device_type,u.last_seen
             from server_members sm join users u on u.id=sm.user_id
             where sm.server_id=%s order by
             case sm.role when 'owner' then 3 when 'admin' then 2 when 'moderator' then 1 else 0 end desc,
             u.username
         """,(sid,)).fetchall()
+
     now=datetime.now(timezone.utc)
-    return jsonify(members=[
-        {"id":r[0],"username":r[1],"avatar":r[2],"role":r[3],
-         "muted":bool(r[4] and r[4]>now),"banned":bool(r[5] and r[5]>now),"device_type":r[6]} for r in rows
-    ])
+    members=[]
+
+    for r in rows:
+        presence=presence_payload(r[7])
+        members.append({
+            "id":r[0],
+            "username":r[1],
+            "avatar":r[2],
+            "role":r[3],
+            "muted":bool(r[4] and r[4]>now),
+            "banned":bool(r[5] and r[5]>now),
+            "device_type":r[6],
+            "online":presence["online"],
+            "last_seen":presence["last_seen"]
+        })
+
+    return jsonify(members=members)
 
 @app.post("/api/servers/<int:sid>/members")
 @login_required
@@ -4446,45 +5066,93 @@ def invite_page(code):
 @app.get("/api/messages")
 @login_required
 def messages_get():
-    kind=request.args.get("kind");channel=request.args.get("channel")
-    sid=request.args.get("server_id");cid=request.args.get("chat_id")
+    kind=request.args.get("kind")
+    channel=request.args.get("channel")
+    sid=request.args.get("server_id")
+    cid=request.args.get("chat_id")
+    settings=get_site_settings()
+
     with connect() as c:
         if kind=="public":
             rows=c.execute("""
-              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,case when u.show_staff_tag then u.global_role else 'user' end
-              from messages m join users u on u.id=m.user_id
-              where m.kind='public' and m.channel=%s order by m.created_at desc limit 150
+              select m.id,m.user_id,m.content,m.created_at,m.edited_at,
+                     u.username,u.avatar,
+                     case when u.show_staff_tag then u.global_role else 'user' end,
+                     m.is_spookhook,m.reply_to_id
+              from messages m
+              join users u on u.id=m.user_id
+              where m.kind='public' and m.channel=%s
+              order by m.created_at desc
+              limit 150
             """,(channel,)).fetchall()
+
         elif kind=="server":
-            sm=server_member(sid,request.me["id"])
-            if not sm:return jsonify(error="Not a server member"),403
-            if sm["banned_until"] and sm["banned_until"]>datetime.now(timezone.utc):return jsonify(error="Banned"),403
-            try: channel_id=int(channel)
-            except Exception:return jsonify(error="Invalid channel"),400
-            if not channel_access(sid,channel_id,request.me["id"],"view"):return jsonify(error="You cannot view this channel"),403
+            try:
+                channel_id=int(channel)
+                sid_int=int(sid)
+            except Exception:
+                return jsonify(error="Invalid channel"),400
+
+            sm,viewer_perms=channel_effective_permissions(
+                sid_int,channel_id,request.me["id"]
+            )
+            if not sm:
+                return jsonify(error="Not a server member"),403
+            if sm["banned_until"] and sm["banned_until"]>datetime.now(timezone.utc):
+                return jsonify(error="Banned"),403
+            if "view_channels" not in viewer_perms:
+                return jsonify(error="You cannot view this channel"),403
+
             rows=c.execute("""
               select m.id,m.user_id,m.content,m.created_at,m.edited_at,
                      case when m.is_spookhook then m.hook_name else u.username end,
-                     u.avatar,coalesce(sm.role,'member'),m.is_spookhook
-              from messages m join users u on u.id=m.user_id
-              left join server_members sm on sm.server_id=m.server_id and sm.user_id=m.user_id
-              where m.kind='server' and m.server_id=%s and m.channel=%s order by m.created_at desc limit 150
-            """,(sid,str(channel_id))).fetchall()
-        else:
-            ok=c.execute("select 1 from chat_members where chat_id=%s and user_id=%s",(cid,request.me["id"])).fetchone()
-            if not ok:return jsonify(error="Not a chat member"),403
-            rows=c.execute("""
-              select m.id,m.user_id,m.content,m.created_at,m.edited_at,u.username,u.avatar,case when u.show_staff_tag then u.global_role else 'user' end
-              from messages m join users u on u.id=m.user_id
-              where m.kind='dm' and m.chat_id=%s order by m.created_at desc limit 150
-            """,(cid,)).fetchall()
-    ordered=list(reversed(rows))
-    message_ids=[r[0] for r in ordered]
-    reaction_map={}
+                     u.avatar,coalesce(author_sm.role,'member'),
+                     m.is_spookhook,m.reply_to_id
+              from messages m
+              join users u on u.id=m.user_id
+              left join server_members author_sm
+                on author_sm.server_id=m.server_id
+               and author_sm.user_id=m.user_id
+              where m.kind='server'
+                and m.server_id=%s
+                and m.channel=%s
+              order by m.created_at desc
+              limit 150
+            """,(sid_int,str(channel_id))).fetchall()
 
-    if message_ids:
-        with connect() as rc:
-            rr=rc.execute("""
+        elif kind=="dm":
+            try:
+                cid_int=int(cid)
+            except Exception:
+                return jsonify(error="Invalid chat"),400
+
+            ok=c.execute(
+                "select 1 from chat_members where chat_id=%s and user_id=%s",
+                (cid_int,request.me["id"])
+            ).fetchone()
+            if not ok:
+                return jsonify(error="Not a chat member"),403
+
+            rows=c.execute("""
+              select m.id,m.user_id,m.content,m.created_at,m.edited_at,
+                     u.username,u.avatar,
+                     case when u.show_staff_tag then u.global_role else 'user' end,
+                     m.is_spookhook,m.reply_to_id
+              from messages m
+              join users u on u.id=m.user_id
+              where m.kind='dm' and m.chat_id=%s
+              order by m.created_at desc
+              limit 150
+            """,(cid_int,)).fetchall()
+        else:
+            return jsonify(error="Invalid message type"),400
+
+        ordered=list(reversed(rows))
+        message_ids=[r[0] for r in ordered]
+
+        reaction_map={}
+        if message_ids:
+            reaction_rows=c.execute("""
                 select message_id,emoji,count(*),bool_or(user_id=%s)
                 from message_reactions
                 where message_id=any(%s)
@@ -4492,12 +5160,52 @@ def messages_get():
                 order by emoji
             """,(request.me["id"],message_ids)).fetchall()
 
-        for mid,emoji,count,mine in rr:
-            reaction_map.setdefault(mid,[]).append({
-                "emoji":emoji,
-                "count":count,
-                "mine":bool(mine)
-            })
+            for mid,emoji,count,mine in reaction_rows:
+                reaction_map.setdefault(mid,[]).append({
+                    "emoji":emoji,
+                    "count":count,
+                    "mine":bool(mine)
+                })
+
+        reply_ids=list({r[9] for r in ordered if r[9]})
+        reply_map={}
+        if reply_ids:
+            reply_rows=c.execute("""
+                select m.id,m.content,u.username
+                from messages m
+                join users u on u.id=m.user_id
+                where m.id=any(%s)
+            """,(reply_ids,)).fetchall()
+
+            reply_map={
+                rr[0]:{
+                    "id":rr[0],
+                    "content":rr[1][:180],
+                    "username":rr[2]
+                }
+                for rr in reply_rows
+            }
+
+        embed_author_ids=set()
+        if kind=="server":
+            author_ids=list({r[1] for r in ordered})
+            if author_ids:
+                # Admin/owner built-in roles already get embed_links.
+                for r in ordered:
+                    if r[7] in ("admin","owner"):
+                        embed_author_ids.add(r[1])
+
+                custom_rows=c.execute("""
+                    select smr.user_id,sr.permissions
+                    from server_member_roles smr
+                    join server_roles sr on sr.id=smr.role_id
+                    where smr.server_id=%s and smr.user_id=any(%s)
+                """,(int(sid),author_ids)).fetchall()
+
+                for author_id,raw in custom_rows:
+                    rp=normalize_permissions(raw)
+                    if "embed_links" in rp or "administrator" in rp:
+                        embed_author_ids.add(author_id)
 
     payload=[]
     for r in ordered:
@@ -4510,37 +5218,114 @@ def messages_get():
             "username":r[5],
             "avatar":r[6],
             "role":r[7],
-            "is_spookhook":bool(r[8]) if len(r)>8 else False,
+            "is_spookhook":bool(r[8]),
             "reactions":reaction_map.get(r[0],[]),
             "embed_url":extract_first_url(r[2]),
             "embed_allowed":True,
-            "reply":None
+            "reply":reply_map.get(r[9]) if r[9] else None
         }
 
-        reply_row=None
-        with connect() as rr_conn:
-            reply_row=rr_conn.execute("""
-                select m.id,m.content,u.username
-                from messages m
-                join users u on u.id=m.user_id
-                where m.id=(select reply_to_id from messages where id=%s)
-            """,(r[0],)).fetchone()
-
-        if reply_row:
-            item["reply"]={
-                "id":reply_row[0],
-                "content":reply_row[1][:180],
-                "username":reply_row[2]
-            }
-
-        if kind=="server" and sid:
-            item["embed_allowed"]=message_embed_allowed(kind,sid,r[1])
+        if kind=="server":
+            item["embed_allowed"]=r[1] in embed_author_ids
         elif kind=="public":
-            item["embed_allowed"]=get_site_settings()["public_embeds_enabled"]
+            item["embed_allowed"]=settings["public_embeds_enabled"]
 
         payload.append(item)
 
     return jsonify(messages=payload)
+
+
+@app.post("/api/typing")
+@login_required
+def typing_update():
+    d=request.get_json(silent=True) or {}
+    kind=str(d.get("kind",""))
+    channel=d.get("channel")
+    sid=d.get("server_id")
+    cid=d.get("chat_id")
+
+    try:
+        scope=typing_scope_key(kind,channel,sid,cid)
+    except Exception:
+        return jsonify(error="Invalid typing scope"),400
+
+    if not scope:
+        return jsonify(error="Invalid typing scope"),400
+
+    if kind=="server":
+        try:
+            sid=int(sid)
+            channel=int(channel)
+        except Exception:
+            return jsonify(error="Invalid server channel"),400
+
+        sm,perms=channel_effective_permissions(
+            sid,channel,request.me["id"]
+        )
+        if not sm or "view_channels" not in perms:
+            return jsonify(error="No channel access"),403
+
+    elif kind=="dm":
+        try:
+            cid=int(cid)
+        except Exception:
+            return jsonify(error="Invalid chat"),400
+
+        with connect() as c:
+            ok=c.execute(
+                "select 1 from chat_members where chat_id=%s and user_id=%s",
+                (cid,request.me["id"])
+            ).fetchone()
+
+        if not ok:
+            return jsonify(error="Not a chat member"),403
+
+    with connect() as c:
+        c.execute("""
+            insert into typing_status(user_id,scope_key,expires_at)
+            values(%s,%s,now()+interval '4 seconds')
+            on conflict(user_id,scope_key)
+            do update set expires_at=excluded.expires_at
+        """,(request.me["id"],scope))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.get("/api/typing")
+@login_required
+def typing_get():
+    kind=request.args.get("kind","")
+    channel=request.args.get("channel")
+    sid=request.args.get("server_id")
+    cid=request.args.get("chat_id")
+
+    try:
+        scope=typing_scope_key(kind,channel,sid,cid)
+    except Exception:
+        return jsonify(typing=[])
+
+    if not scope:
+        return jsonify(typing=[])
+
+    with connect() as c:
+        rows=c.execute("""
+            select u.id,u.username
+            from typing_status ts
+            join users u on u.id=ts.user_id
+            where ts.scope_key=%s
+              and ts.expires_at>now()
+              and ts.user_id<>%s
+            order by lower(u.username)
+            limit 8
+        """,(scope,request.me["id"])).fetchall()
+
+    return jsonify(
+        typing=[
+            {"id":r[0],"username":r[1]}
+            for r in rows
+        ]
+    )
 
 @app.post("/api/messages")
 @login_required
@@ -4564,14 +5349,20 @@ def messages_post():
     if kind=="public" and channel not in ("chat1","chat2"):
         return jsonify(error="Invalid public channel"),400
     if kind=="server":
-        sm=server_member(sid,request.me["id"]);now=datetime.now(timezone.utc)
+        now=datetime.now(timezone.utc)
+        try:
+            sid=int(sid);channel=int(channel)
+        except Exception:
+            return jsonify(error="Invalid channel"),400
+
+        sm,effective_perms=channel_effective_permissions(
+            sid,channel,request.me["id"]
+        )
         if not sm:return jsonify(error="Not a server member"),403
         if sm["banned_until"] and sm["banned_until"]>now:return jsonify(error="Banned from server"),403
         if sm["muted_until"] and sm["muted_until"]>now:return jsonify(error="Restricted from talking"),403
-        try: channel=int(channel)
-        except Exception:return jsonify(error="Invalid channel"),400
-        if not channel_access(sid,channel,request.me["id"],"view"):return jsonify(error="You cannot view this channel"),403
-        if not channel_access(sid,channel,request.me["id"],"talk"):return jsonify(error="Your role cannot talk in this channel"),403
+        if "view_channels" not in effective_perms:return jsonify(error="You cannot view this channel"),403
+        if "send_messages" not in effective_perms:return jsonify(error="Your role cannot talk in this channel"),403
         channel=str(channel)
     if kind=="dm":
         with connect() as c:
@@ -4828,6 +5619,7 @@ def owner_site_settings():
         """,(maintenance,msg,registrations,site_name,announcement,
              public_channels_locked,public_embeds_enabled))
         c.commit()
+    clear_site_settings_cache()
     audit_owner_action(request.me["id"],"update_site_settings","site","1",
                        f"maintenance={maintenance}, registrations={registrations}")
     return jsonify(ok=True,settings=get_site_settings())
