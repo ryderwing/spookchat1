@@ -190,6 +190,31 @@ create table if not exists spookhooks(
  created_at timestamptz not null default now()
 );
 
+
+create table if not exists vyntra_bots(
+ id bigserial primary key,
+ owner_id bigint not null references users(id) on delete cascade,
+ public_id text not null unique,
+ name text not null,
+ description text not null default '',
+ avatar text not null default '',
+ token_hash text not null unique,
+ requested_permissions jsonb not null default '[]'::jsonb,
+ created_at timestamptz not null default now()
+);
+
+create table if not exists bot_server_installs(
+ bot_id bigint not null references vyntra_bots(id) on delete cascade,
+ server_id bigint not null references servers(id) on delete cascade,
+ installed_by bigint not null references users(id) on delete cascade,
+ permissions jsonb not null default '[]'::jsonb,
+ installed_at timestamptz not null default now(),
+ primary key(bot_id,server_id)
+);
+
+create index if not exists bot_server_installs_server_idx
+on bot_server_installs(server_id);
+
 create table if not exists chats(
  id bigserial primary key,
  kind text not null,
@@ -217,6 +242,7 @@ create table if not exists messages(
  is_spookhook boolean not null default false,
  hook_name text not null default '',
  reply_to_id bigint references messages(id) on delete set null,
+ bot_id bigint references vyntra_bots(id) on delete set null,
  created_at timestamptz not null default now()
 );
 
@@ -338,6 +364,33 @@ def init_db():
 
             c.execute("alter table messages add column if not exists is_spookhook boolean not null default false")
             c.execute("alter table messages add column if not exists hook_name text not null default ''")
+
+            c.execute("""
+                create table if not exists vyntra_bots(
+                 id bigserial primary key,
+                 owner_id bigint not null references users(id) on delete cascade,
+                 public_id text not null unique,
+                 name text not null,
+                 description text not null default '',
+                 avatar text not null default '',
+                 token_hash text not null unique,
+                 requested_permissions jsonb not null default '[]'::jsonb,
+                 created_at timestamptz not null default now()
+                )
+            """)
+            c.execute("""
+                create table if not exists bot_server_installs(
+                 bot_id bigint not null references vyntra_bots(id) on delete cascade,
+                 server_id bigint not null references servers(id) on delete cascade,
+                 installed_by bigint not null references users(id) on delete cascade,
+                 permissions jsonb not null default '[]'::jsonb,
+                 installed_at timestamptz not null default now(),
+                 primary key(bot_id,server_id)
+                )
+            """)
+            c.execute("create index if not exists bot_server_installs_server_idx on bot_server_installs(server_id)")
+            c.execute("alter table messages add column if not exists bot_id bigint references vyntra_bots(id) on delete set null")
+
             c.execute("alter table messages add column if not exists reply_to_id bigint references messages(id) on delete set null")
             c.execute("create index if not exists messages_reply_idx on messages(reply_to_id)")
 
@@ -533,6 +586,93 @@ def typing_scope_key(kind,channel=None,server_id=None,chat_id=None):
     if kind=="dm":
         return f"dm:{int(chat_id)}"
     return ""
+
+
+
+BOT_PERMISSION_KEYS = [
+    "view_channels",
+    "read_messages",
+    "send_messages",
+    "embed_links",
+    "add_reactions",
+    "manage_messages"
+]
+
+def normalize_bot_permissions(value):
+    if not isinstance(value,(list,tuple,set)):
+        return set()
+    return {str(x) for x in value if str(x) in BOT_PERMISSION_KEYS}
+
+def can_install_bot_to_server(sid,uid):
+    sm=server_member(sid,uid)
+    if not sm:
+        return False
+    if sm["role"] in ("admin","owner"):
+        return True
+
+    # A custom Administrator role counts as server admin permission.
+    with connect() as c:
+        rows=c.execute("""
+            select sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,uid)).fetchall()
+
+    for row in rows:
+        if "administrator" in normalize_permissions(row[0]):
+            return True
+    return False
+
+def create_bot_token():
+    return "vyntra_bot_" + secrets.token_urlsafe(36)
+
+def bot_token_hash(token):
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+def bot_auth_required(fn):
+    @wraps(fn)
+    def wrap(*args,**kwargs):
+        header=request.headers.get("Authorization","").strip()
+        token=""
+        if header.lower().startswith("bot "):
+            token=header[4:].strip()
+        elif header.lower().startswith("bearer "):
+            token=header[7:].strip()
+
+        if not token or not token.startswith("vyntra_bot_"):
+            return jsonify(error="Missing or invalid bot token"),401
+
+        with connect() as c:
+            row=c.execute("""
+                select id,owner_id,public_id,name,description,avatar,requested_permissions
+                from vyntra_bots
+                where token_hash=%s
+            """,(bot_token_hash(token),)).fetchone()
+
+        if not row:
+            return jsonify(error="Invalid bot token"),401
+
+        request.bot={
+            "id":row[0],
+            "owner_id":row[1],
+            "public_id":row[2],
+            "name":row[3],
+            "description":row[4],
+            "avatar":row[5],
+            "requested_permissions":list(row[6] or [])
+        }
+        return fn(*args,**kwargs)
+    return wrap
+
+def bot_install_permissions(bot_id,sid):
+    with connect() as c:
+        row=c.execute("""
+            select permissions
+            from bot_server_installs
+            where bot_id=%s and server_id=%s
+        """,(bot_id,sid)).fetchone()
+    return normalize_bot_permissions(row[0]) if row else set()
 
 
 def client_ip():
@@ -2535,6 +2675,30 @@ body.theme-light .replyBar{
   }
 }
 
+
+/* ============================================================
+   VYNTRA BOTS BETA
+   ============================================================ */
+.betaTabs{margin-bottom:14px}
+.botCard{min-width:0}
+.botAvatar{width:48px;height:48px}
+.botPermSummary{display:flex;flex-wrap:wrap;gap:5px}
+.botCode{
+  padding:13px;
+  border-radius:13px;
+  background:#0b0810;
+  border:1px solid rgba(255,255,255,.07);
+  color:#bcaacb;
+  white-space:pre-wrap;
+  overflow-x:auto;
+  font-size:12px;
+}
+.botPermissionRow input{flex:0 0 auto}
+@media(max-width:720px){
+  .desktopBetaPage{display:none!important}
+  .sideBtn[onclick="showBeta()"]{display:none!important}
+}
+
 </style>
 </head>
 <body>
@@ -2616,6 +2780,7 @@ async function boot(){
    renderApp();
    startNotificationPolling();
    setTimeout(checkInviteFromURL,150);
+   setTimeout(checkBotInviteFromURL,220);
  }catch(e){renderLogin()}
 }
 
@@ -2665,6 +2830,7 @@ function sidebar(){
    <button class="sideBtn" onclick="showNotifications()"><span class="iconBox">🔔</span>Notifications <span id="notificationsUnreadSide" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>
    <button class="sideBtn" onclick="groupCreate()"><span class="iconBox">＋</span>New Group</button>
    ${isStaff?`<button class="sideBtn ${state.view==="staff"?"active":""}" onclick="showStaff()"><span class="iconBox">🛡</span>Moderation</button>`:""}${state.profile.global_role==="owner"?`<button class="sideBtn ${state.view==="owner"?"active":""}" onclick="showOwnerPanel()"><span class="iconBox">👑</span>Owner Control</button>`:""}
+   <button class="sideBtn ${state.view==="beta"?"active":""}" onclick="showBeta()"><span class="iconBox">🧪</span>Beta</button>
    <button class="sideBtn ${state.view==="settings"?"active":""}" onclick="showSettings()"><span class="iconBox">⚙</span>VYNTRA Settings</button>
    <a class="sideBtn" href="/static/downloads/VYNTRAPCSet-up.exe" download="VYNTRAPCSet-up.exe" style="text-decoration:none"><span class="iconBox">⬇</span>Download Desktop App</a>
    <button class="sideBtn ${state.view==="discover"?"active":""}" onclick="showServerDiscovery()"><span class="iconBox">🔎</span>Discover Servers</button>
@@ -2774,6 +2940,7 @@ function renderApp(){
  else if(state.view==="settings")renderSettings();
  else if(state.view==="staff")renderStaff();
  else if(state.view==="owner")renderOwnerPanel();
+ else if(state.view==="beta")renderBeta();
  else if(state.view==="discover")renderServerDiscovery();
  else if(state.view==="server")renderServer();
  else renderChat();
@@ -2834,7 +3001,8 @@ async function loadMessages(force=false){
      m.edited_at||"",
      m.content,
      (m.reactions||[]).map(r=>`${r.emoji}:${r.count}:${r.mine?1:0}`).join(","),
-     m.reply?.id||0
+     m.reply?.id||0,
+     m.is_bot?1:0
    ].join("|")).join("~");
 
    state.messages=messages;
@@ -2856,7 +3024,7 @@ function drawMessages(){
  el.innerHTML=state.messages.map(m=>`<div class="msg ${m._optimistic?"sending":""}" id="message-${m.id}" oncontextmenu="${m._optimistic?"":`messageMenu(event,${m.id})`}">
    <img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'">
    <div class="msgBody"><div class="meta"><span class="name">${esc(m.username)}</span>
-   ${m.is_spookhook?`<span class="roleTag">VYNTRAHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:"")}
+   ${m.is_bot?`<span class="roleTag">BOT</span>`:(m.is_spookhook?`<span class="roleTag">VYNTRAHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:""))}
    <span class="time">${new Date(m.created_at).toLocaleString([], {hour:'2-digit',minute:'2-digit'})}</span>
    ${m.edited_at?`<span class="edited">(edited)</span>`:""}${m._optimistic?`<span class="edited">sending…</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}<div class="text">${linkifyText(m.content)}</div>${renderLinkEmbed(m)}${renderReactions(m)}</div>
  </div>`).join("");
@@ -3138,10 +3306,11 @@ async function toggleReaction(mid,emoji){
 
 
 function startReply(mid){
- const m=(window._lastMessages||[]).find(x=>Number(x.id)===Number(mid));
- if(!m)return;
- state.replyingTo={id:m.id,username:m.username,content:m.content};
+ const m=(window._lastMessages||state.messages||[]).find(x=>Number(x.id)===Number(mid));
+ if(!m){toast("Could not find that message to reply to");return;}
+ state.replyingTo={id:Number(m.id),username:m.username,content:m.content};
  renderReplyBar();
+ toast(`Replying to ${m.username}`);
  const input=document.getElementById("messageInput");
  if(input)input.focus();
 }
@@ -3169,16 +3338,52 @@ function scrollToMessage(mid){
  setTimeout(()=>el.classList.remove("replyFlash"),1200);
 }
 
+
+async function copyText(text){
+ const value=String(text??"");
+ try{
+   if(navigator.clipboard && window.isSecureContext){
+     await navigator.clipboard.writeText(value);
+     return true;
+   }
+ }catch(e){}
+
+ try{
+   const ta=document.createElement("textarea");
+   ta.value=value;
+   ta.setAttribute("readonly","");
+   ta.style.position="fixed";
+   ta.style.opacity="0";
+   ta.style.pointerEvents="none";
+   document.body.appendChild(ta);
+   ta.focus();
+   ta.select();
+   const ok=document.execCommand("copy");
+   ta.remove();
+   return !!ok;
+ }catch(e){
+   return false;
+ }
+}
+
+async function copyMessage(mid){
+ const m=(state.messages||[]).find(x=>Number(x.id)===Number(mid));
+ if(!m){toast("Message not found");return;}
+ const ok=await copyText(m.content);
+ toast(ok?"Message copied":"Copy failed");
+ closeContext();
+}
+
 function messageMenu(ev,id){
  ev.preventDefault();ev.stopPropagation();
  const m=state.messages.find(x=>x.id===id);if(!m)return;
- const mine=Number(m.user_id)===Number(state.me.id);
+ const mine=!m.is_bot&&Number(m.user_id)===Number(state.me.id);
  const globalStaff=["moderator","admin","owner"].includes(state.profile.global_role);
  const serverStaff=state.view==="server"&&state.serverInfo&&["moderator","admin","owner"].includes(state.serverInfo.my_role);
  const canDelete=mine||globalStaff||serverStaff;
  overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-260)}px" onclick="event.stopPropagation()">
  <button onclick="startReply(${m.id});closeContext()">↩ Reply</button><button onclick="viewProfile(${m.user_id});closeContext()">👤 View profile</button>
- <button onclick="navigator.clipboard.writeText(${JSON.stringify(m.content)});toast('Copied');closeContext()">📋 Copy message</button>
+ <button onclick="copyMessage(${m.id})">📋 Copy message</button>
  <button onclick="reportMessage(${m.id});closeContext()">🚩 Report message</button>
  ${mine?`<button onclick="editMessagePrompt(${m.id});closeContext()">✏️ Edit message</button>`:""}
  ${canDelete?`<button class="red" onclick="deleteMessage(${m.id});closeContext()">🗑 Delete message</button>`:""}
@@ -3396,8 +3601,36 @@ async function showServerSettings(id){
    <div class="card" style="margin-top:16px"><h3>Joining</h3><div class="muted">Members can only join this server themselves from Discover Servers.</div></div><div class="card"><div class="row between"><div><h3 style="margin:0">Join Requests</h3><div class="muted">Used when Server Privacy is set to Public + Owner Approval.</div></div><button class="ghost" onclick="loadJoinRequests(${id})">Refresh</button></div><div id="joinRequestsList" style="margin-top:10px">Loading...</div></div>
    <div class="card"><div class="row between"><h3 style="margin:0">Custom Roles</h3>${hasServerPerm("manage_roles")?`<button class="primary" onclick="createCustomRole(${id})">＋ Role</button>`:""}</div><div style="margin-top:10px">${state.serverRoles.length?state.serverRoles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">${Object.entries(r.permissions||{}).filter(([k,v])=>v).length} enabled permission${Object.entries(r.permissions||{}).filter(([k,v])=>v).length===1?"":"s"}</div></div><button class="ghost" onclick="editCustomRole(${id},${r.id})">Edit Permissions</button><button class="danger" onclick="deleteCustomRole(${id},${r.id})">Delete</button></div>`).join(""):'<div class="muted">No custom roles yet.</div>'}</div>
    <div class="card"><h3>Members (${d.members.length})</h3>${d.members.map(m=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)}</div></div>${m.role!=="owner"?`<button class="ghost" onclick="changeServerRoleFromSettings(${id},${m.id})">Staff Role</button><button class="ghost" onclick="manageMemberCustomRoles(${id},${m.id})">Custom Roles</button><button class="danger" onclick="removeServerMember(${id},${m.id})">Remove</button>`:""}</div>`).join("")}</div>
+   <div class="card"><div class="row between"><div><h3 style="margin:0">Installed Bots</h3><div class="muted">Bots installed through Vyntra Bot invite links.</div></div><button class="ghost" onclick="loadServerBots(${id})">Refresh</button></div><div id="installedBotsList" style="margin-top:10px">Loading...</div></div>
    <div class="card"><h3>Danger zone</h3><button class="danger" onclick="deleteServer(${id})">Delete server</button></div>`);
    setTimeout(()=>loadJoinRequests(id),20);
+   setTimeout(()=>loadServerBots(id),30);
+ }catch(e){toast(e.message)}
+}
+
+
+async function loadServerBots(sid){
+ const el=document.getElementById("installedBotsList");
+ if(!el)return;
+ try{
+   const d=await api(`/api/servers/${sid}/bots`);
+   el.innerHTML=d.bots.length?d.bots.map(b=>`
+     <div class="listItem">
+       <img class="avatar" src="${avatarSrc(b.avatar)}">
+       <div class="listMain"><div class="listTitle">${esc(b.name)} <span class="roleTag">BOT</span></div><div class="listSub">${(b.permissions||[]).map(p=>BOT_PERMISSION_LABELS[p]?.[0]||p).join(", ")||"No permissions"}</div></div>
+       ${state.serverInfo&&["admin","owner"].includes(state.serverInfo.my_role)?`<button class="danger" onclick="removeServerBot(${sid},${b.id})">Remove</button>`:""}
+     </div>`).join(""):`<div class="muted">No bots installed.</div>`;
+ }catch(e){
+   el.innerHTML=`<div class="muted">${esc(e.message)}</div>`;
+ }
+}
+
+async function removeServerBot(sid,bid){
+ if(!confirm("Remove this bot from the server?"))return;
+ try{
+   await api(`/api/servers/${sid}/bots/${bid}`,{method:"DELETE"});
+   toast("Bot removed");
+   loadServerBots(sid);
  }catch(e){toast(e.message)}
 }
 
@@ -3450,7 +3683,7 @@ async function savePreferences(){try{const body={theme:themeSelect.value};if(doc
 function createChannelPrompt(){modalOpen("Create channel",`<form class="formGrid" onsubmit="createChannel(event)"><div class="label">Channel name</div><input id="newChannelName" class="field" maxlength="40" required><div class="label">Type</div><select id="newChannelKind" class="field"><option value="chat">Chat</option><option value="announcement">Announcement</option></select><div class="modalActions"><button class="primary">Create</button></div></form>`)}
 async function createChannel(e){e.preventDefault();try{await api(`/api/servers/${state.activeServer}/channels`,{method:"POST",body:JSON.stringify({name:newChannelName.value,kind:newChannelKind.value})});modalClose();await openServer(state.activeServer)}catch(e){toast(e.message)}}
 
-async function channelMenu(ev,cid){ev.preventDefault();ev.stopPropagation();if(!hasServerPerm("manage_channels"))return;overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-230)}px" onclick="event.stopPropagation()"><button onclick="channelSettings(${cid});closeContext()">⚙ Channel settings</button><button onclick="showVyntraHooks(${cid});closeContext()">🔗 VyntraHooks (Beta)</button><button class="red" onclick="deleteChannel(${cid});closeContext()">🗑 Delete channel</button></div>`}
+async function channelMenu(ev,cid){ev.preventDefault();ev.stopPropagation();if(!hasServerPerm("manage_channels"))return;overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-230)}px" onclick="event.stopPropagation()"><button onclick="channelSettings(${cid});closeContext()">⚙ Channel settings</button><button onclick="showVyntraHooks(${cid});closeContext()">🔗 VyntraHooks</button><button class="red" onclick="deleteChannel(${cid});closeContext()">🗑 Delete channel</button></div>`}
 function channelRoleOptions(){
  const built=[["member","Member"],["moderator","Moderator"],["admin","Admin"],["owner","Owner"]];
  return [...built,...state.serverRoles.map(r=>[`custom:${r.id}`,r.name])];
@@ -3554,7 +3787,7 @@ async function deleteCustomRole(sid,rid){if(!confirm("Delete this custom role?")
 async function manageMemberCustomRoles(sid,uid){try{const username=(state.serverMembers.find(x=>Number(x.id)===Number(uid))?.username||"Member");const d=await api(`/api/servers/${sid}/members/${uid}/custom-roles`);modalOpen("Roles for "+username,`<div class="formGrid">${state.serverRoles.length?state.serverRoles.map(r=>`<label class="row"><input type="checkbox" ${d.role_ids.includes(r.id)?"checked":""} onchange="toggleMemberCustomRole(${sid},${uid},${r.id},this.checked)"> ${esc(r.name)}</label>`).join(""):'<div class="muted">Create custom roles first.</div>'}</div>`)}catch(e){toast(e.message)}}
 async function toggleMemberCustomRole(sid,uid,rid,enabled){try{await api(`/api/servers/${sid}/members/${uid}/custom-role`,{method:"POST",body:JSON.stringify({role_id:rid,enabled})});toast("Role assignment updated")}catch(e){toast(e.message)}}
 
-async function showVyntraHooks(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`);modalOpen("VyntraHooks · Beta",`<div class="muted">A VyntraHook is a secret incoming link that can post messages into this channel. Never share a hook URL publicly.</div><div class="card" style="margin-top:12px"><div class="searchBox"><input id="hookName" class="field" placeholder="Hook name" value="VyntraHook"><button class="primary" onclick="createVyntraHook(${cid})">Create</button></div></div><div>${d.hooks.length?d.hooks.map(h=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(h.name)}</div><div class="listSub">Created ${new Date(h.created_at).toLocaleString()}</div></div><button class="danger" onclick="deleteVyntraHook(${cid},${h.id})">Delete</button></div>`).join(""):'<div class="muted">No hooks for this channel.</div>'}</div>`)}catch(e){toast(e.message)}}
+async function showVyntraHooks(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`);modalOpen("VyntraHooks",`<div class="muted">A VyntraHook is a secret incoming link that can post messages into this channel. Never share a hook URL publicly.</div><div class="card" style="margin-top:12px"><div class="searchBox"><input id="hookName" class="field" placeholder="Hook name" value="VyntraHook"><button class="primary" onclick="createVyntraHook(${cid})">Create</button></div></div><div>${d.hooks.length?d.hooks.map(h=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(h.name)}</div><div class="listSub">Created ${new Date(h.created_at).toLocaleString()}</div></div><button class="danger" onclick="deleteVyntraHook(${cid},${h.id})">Delete</button></div>`).join(""):'<div class="muted">No hooks for this channel.</div>'}</div>`)}catch(e){toast(e.message)}}
 async function createVyntraHook(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`,{method:"POST",body:JSON.stringify({name:hookName.value})});modalOpen("VyntraHook created",`<div class="card"><div class="muted">Copy this URL now. For security, VYNTRA will not show this secret URL again.</div><input id="newHookUrl" class="field" value="${esc(d.url)}" readonly style="margin-top:10px"><button class="primary" style="margin-top:10px" onclick="navigator.clipboard.writeText(newHookUrl.value);toast('Copied')">Copy URL</button></div><div class="card"><div class="label">Example JSON POST body</div><pre style="white-space:pre-wrap">{"content":"Hello from my app","username":"My Bot"}</pre></div>`)}catch(e){toast(e.message)}}
 async function deleteVyntraHook(cid,hid){if(!confirm("Delete this VyntraHook? Its URL will stop working."))return;try{await api(`/api/servers/${state.activeServer}/spookhooks/${hid}`,{method:"DELETE"});showVyntraHooks(cid)}catch(e){toast(e.message)}}
 
@@ -3760,6 +3993,207 @@ async function loadOwnerAudit(){
  }catch(e){toast(e.message)}
 }
 
+
+const BOT_PERMISSION_LABELS={
+ view_channels:["View Channels","Allows the bot to see the server channel list."],
+ read_messages:["Read Message History","Allows the bot API to read recent channel messages."],
+ send_messages:["Send Messages","Allows the bot to send messages into server channels."],
+ embed_links:["Embed Links","Reserved for bot messages that include links."],
+ add_reactions:["Add Reactions","Allows the bot to react to messages."],
+ manage_messages:["Manage Messages","Allows the bot to delete messages it does not own."]
+};
+
+function showBeta(){
+ state.view="beta";
+ state.activeServer=null;
+ renderApp();
+}
+
+async function renderBeta(){
+ appShell.classList.remove("with-members");
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">Beta</div><div class="topSub">Experimental VYNTRA features</div></div><div class="topActions">${notificationBellButton()}</div></header>
+ <div class="page desktopBetaPage">
+   <div class="pageHero"><div><h1>Beta</h1><div class="muted">Try experimental desktop features before they move into VYNTRA.</div></div></div>
+   <div class="tabs betaTabs"><button class="active">Vyntra Bots</button></div>
+   <div class="card"><div class="row between"><div><h3 style="margin:0">Vyntra Bots</h3><div class="muted">Create programmable bots, choose their permissions, then install them into servers with an invite link.</div></div><button class="primary" onclick="createBotPrompt()">＋ Create Bot</button></div></div>
+   <div id="botList" class="grid2"><div class="muted">Loading bots...</div></div>
+   <div class="card"><h3>Bot API</h3><div class="muted">Use your bot token in the Authorization header. Keep the token secret.</div><pre class="botCode">Authorization: Bot YOUR_BOT_TOKEN
+
+GET  /api/bot/v1/me
+GET  /api/bot/v1/servers
+GET  /api/bot/v1/servers/&lt;server_id&gt;/channels
+GET  /api/bot/v1/channels/&lt;channel_id&gt;/messages
+POST /api/bot/v1/channels/&lt;channel_id&gt;/messages
+DELETE /api/bot/v1/messages/&lt;message_id&gt;
+POST /api/bot/v1/messages/&lt;message_id&gt;/reactions</pre></div>
+ </div>`;
+ await loadBots();
+}
+
+function botPermissionChecks(selected=[]){
+ const have=new Set(selected||[]);
+ return Object.entries(BOT_PERMISSION_LABELS).map(([key,[name,desc]])=>`
+ <label class="listItem botPermissionRow" style="cursor:pointer">
+   <input type="checkbox" data-botperm="${key}" ${have.has(key)?"checked":""}>
+   <div class="listMain"><div class="listTitle">${name}</div><div class="listSub">${desc}</div></div>
+ </label>`).join("");
+}
+
+function collectBotPermissions(){
+ return [...document.querySelectorAll("[data-botperm]:checked")].map(x=>x.dataset.botperm);
+}
+
+async function loadBots(){
+ try{
+   const d=await api("/api/bots");
+   window._vyntraBots=d.bots||[];
+   const el=document.getElementById("botList");
+   if(!el)return;
+   el.innerHTML=d.bots.length?d.bots.map(b=>`
+     <div class="card botCard">
+       <div class="row">
+         <img class="avatar botAvatar" src="${avatarSrc(b.avatar)}">
+         <div class="listMain"><div class="listTitle">${esc(b.name)} <span class="roleTag">BOT</span></div><div class="listSub">${b.server_count} server${b.server_count===1?"":"s"} · ID ${esc(b.public_id)}</div></div>
+       </div>
+       <p class="muted">${esc(b.description||"No description.")}</p>
+       <div class="botPermSummary">${(b.permissions||[]).map(p=>`<span class="pill">${esc(BOT_PERMISSION_LABELS[p]?.[0]||p)}</span>`).join(" ")||'<span class="muted">No permissions selected.</span>'}</div>
+       <div class="row" style="margin-top:12px;flex-wrap:wrap">
+         <button class="primary" onclick="copyBotInvite(${b.id})">Copy Invite Link</button>
+         <button class="ghost" onclick="editBotPrompt(${b.id})">Edit</button>
+         <button class="ghost" onclick="resetBotToken(${b.id})">Reset Token</button>
+         <button class="danger" onclick="deleteBot(${b.id})">Delete</button>
+       </div>
+     </div>`).join(""):`<div class="card"><div class="muted">You haven't created a bot yet.</div></div>`;
+ }catch(e){toast(e.message)}
+}
+
+function createBotPrompt(){
+ modalOpen("Create Vyntra Bot",`<form class="formGrid" onsubmit="createBot(event)">
+   <div class="label">Bot name</div><input id="botName" class="field" maxlength="40" placeholder="My Bot" required>
+   <div class="label">Description</div><textarea id="botDescription" class="field" rows="3" maxlength="240" placeholder="What does your bot do?"></textarea>
+   <div class="label">Avatar URL</div><input id="botAvatar" class="field" placeholder="https://...">
+   <div class="card"><h3>Requested Server Permissions</h3><div class="muted" style="margin-bottom:8px">People installing the bot will see these permissions before choosing a server.</div>${botPermissionChecks([])}</div>
+   <div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create Bot</button></div>
+ </form>`);
+}
+
+async function createBot(e){
+ e.preventDefault();
+ try{
+   const d=await api("/api/bots",{method:"POST",body:JSON.stringify({
+     name:botName.value,
+     description:botDescription.value,
+     avatar:botAvatar.value,
+     permissions:collectBotPermissions()
+   })});
+   showBotToken(d.token,d.invite_url,true);
+ }catch(e){toast(e.message)}
+}
+
+function showBotToken(token,inviteUrl,isNew=false){
+ modalOpen(isNew?"Bot Created":"New Bot Token",`
+   <div class="card">
+     <h3>${isNew?"Your bot is ready":"Token reset complete"}</h3>
+     <div class="muted">Copy this token now. VYNTRA stores only a one-way hash and cannot show this exact token again.</div>
+     <input id="botTokenBox" class="field" readonly value="${esc(token)}" style="margin-top:10px">
+     <button class="primary" style="margin-top:8px" onclick="copyText(botTokenBox.value).then(ok=>toast(ok?'Token copied':'Copy failed'))">Copy Bot Token</button>
+   </div>
+   ${inviteUrl?`<div class="card"><h3>Invite Link</h3><input id="botInviteBox" class="field" readonly value="${esc(inviteUrl)}"><button class="ghost" style="margin-top:8px" onclick="copyText(botInviteBox.value).then(ok=>toast(ok?'Invite copied':'Copy failed'))">Copy Invite Link</button></div>`:""}
+   <div class="modalActions"><button class="primary" onclick="modalClose();renderBeta()">Done</button></div>
+ `);
+}
+
+async function copyBotInvite(bid){
+ const b=(window._vyntraBots||[]).find(x=>Number(x.id)===Number(bid));
+ if(!b)return;
+ const ok=await copyText(b.invite_url);
+ toast(ok?"Bot invite copied":"Copy failed");
+}
+
+function editBotPrompt(bid){
+ const b=(window._vyntraBots||[]).find(x=>Number(x.id)===Number(bid));
+ if(!b)return;
+ modalOpen("Edit Vyntra Bot",`<form class="formGrid" onsubmit="saveBotEdit(event,${bid})">
+   <div class="label">Bot name</div><input id="botEditName" class="field" maxlength="40" value="${esc(b.name)}" required>
+   <div class="label">Description</div><textarea id="botEditDescription" class="field" rows="3" maxlength="240">${esc(b.description||"")}</textarea>
+   <div class="label">Avatar URL</div><input id="botEditAvatar" class="field" value="${esc(b.avatar||"")}">
+   <div class="card"><h3>Requested Permissions</h3>${botPermissionChecks(b.permissions||[])}</div>
+   <div class="muted">Changing requested permissions does not silently change old installs. Reinstalling from the invite link updates that server's bot permissions.</div>
+   <div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Save Bot</button></div>
+ </form>`);
+}
+
+async function saveBotEdit(e,bid){
+ e.preventDefault();
+ try{
+   await api(`/api/bots/${bid}`,{method:"PATCH",body:JSON.stringify({
+     name:botEditName.value,
+     description:botEditDescription.value,
+     avatar:botEditAvatar.value,
+     permissions:collectBotPermissions()
+   })});
+   modalClose();toast("Bot updated");renderBeta();
+ }catch(e){toast(e.message)}
+}
+
+async function resetBotToken(bid){
+ if(!confirm("Reset this bot token? The old token will stop working immediately."))return;
+ try{
+   const d=await api(`/api/bots/${bid}/reset-token`,{method:"POST"});
+   showBotToken(d.token,"",false);
+ }catch(e){toast(e.message)}
+}
+
+async function deleteBot(bid){
+ if(!confirm("Delete this bot? It will be removed from every server and its token will stop working."))return;
+ try{
+   await api(`/api/bots/${bid}`,{method:"DELETE"});
+   toast("Bot deleted");loadBots();
+ }catch(e){toast(e.message)}
+}
+
+async function checkBotInviteFromURL(){
+ const publicId=new URLSearchParams(location.search).get("bot_invite");
+ if(!publicId)return;
+
+ try{
+   const d=await api("/api/bots/invite/"+encodeURIComponent(publicId));
+   const b=d.bot;
+
+   modalOpen("Add Vyntra Bot",`
+     <div class="row">
+       <img class="avatar" style="width:72px;height:72px" src="${avatarSrc(b.avatar)}">
+       <div><h2 style="margin:0">${esc(b.name)}</h2><div class="muted">${esc(b.description||"Vyntra Bot")}</div></div>
+     </div>
+     <div class="card" style="margin-top:12px"><h3>Requested Permissions</h3>${(b.permissions||[]).map(p=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(BOT_PERMISSION_LABELS[p]?.[0]||p)}</div><div class="listSub">${esc(BOT_PERMISSION_LABELS[p]?.[1]||"")}</div></div></div>`).join("")||'<div class="muted">This bot requests no permissions.</div>'}</div>
+     <div class="card"><h3>Choose a Server</h3>
+       ${d.servers.length?`<select id="botInstallServer" class="field">${d.servers.map(s=>`<option value="${s.id}">${esc(s.name)}${s.installed?" · already installed":""}</option>`).join("")}</select>
+       <div class="muted" style="margin-top:8px">Only servers where you have Admin permissions are shown.</div>`:`<div class="muted">You do not have Admin permissions in any server where this bot can be installed.</div>`}
+     </div>
+     <div class="modalActions">
+       <button class="ghost" onclick="history.replaceState({},'',location.pathname);modalClose()">Cancel</button>
+       ${d.servers.length?`<button class="primary" onclick="installBotFromInvite('${esc(publicId)}')">Add Bot</button>`:""}
+     </div>
+   `);
+ }catch(e){
+   toast(e.message);
+ }
+}
+
+async function installBotFromInvite(publicId){
+ try{
+   const sid=Number(botInstallServer.value);
+   await api(`/api/bots/invite/${encodeURIComponent(publicId)}/install`,{
+     method:"POST",
+     body:JSON.stringify({server_id:sid})
+   });
+   history.replaceState({},'',location.pathname);
+   modalClose();
+   toast("Bot added to server");
+   if(state.activeServer===sid)await openServer(sid,state.channel);
+ }catch(e){toast(e.message)}
+}
+
 function showStaff(){state.view="staff";state.activeServer=null;renderApp()}
 async function renderStaff(){
  appShell.classList.remove("with-members");
@@ -3919,7 +4353,11 @@ def same_origin_api_guard():
     if request.method not in ("POST","PUT","PATCH","DELETE"):
         return None
     # VyntraHooks are intentionally external incoming endpoints protected by a secret token.
-    if request.path.startswith("/api/vyntrahook/") or request.path.startswith("/api/spookhook/"):
+    if (
+        request.path.startswith("/api/vyntrahook/")
+        or request.path.startswith("/api/spookhook/")
+        or request.path.startswith("/api/bot/v1/")
+    ):
         return None
     origin=request.headers.get("Origin")
     if origin:
@@ -3944,6 +4382,215 @@ def add_security_headers(response):
 @app.get("/")
 def home():
     return render_template_string(HTML)
+
+
+@app.get("/api/bot/v1/me")
+@bot_auth_required
+def bot_api_me():
+    return jsonify(bot=request.bot)
+
+
+@app.get("/api/bot/v1/servers")
+@bot_auth_required
+def bot_api_servers():
+    with connect() as c:
+        rows=c.execute("""
+            select s.id,s.name,s.icon,bi.permissions
+            from bot_server_installs bi
+            join servers s on s.id=bi.server_id
+            where bi.bot_id=%s
+            order by lower(s.name)
+        """,(request.bot["id"],)).fetchall()
+
+    return jsonify(servers=[{
+        "id":r[0],
+        "name":r[1],
+        "icon":r[2],
+        "permissions":list(r[3] or [])
+    } for r in rows])
+
+
+@app.get("/api/bot/v1/servers/<int:sid>/channels")
+@bot_auth_required
+def bot_api_channels(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "view_channels" not in perms:
+        return jsonify(error="Bot lacks View Channels permission"),403
+
+    with connect() as c:
+        rows=c.execute("""
+            select id,name,kind,position
+            from server_channels
+            where server_id=%s
+            order by position,id
+        """,(sid,)).fetchall()
+
+    return jsonify(channels=[{
+        "id":r[0],"name":r[1],"kind":r[2],"position":r[3]
+    } for r in rows])
+
+
+@app.get("/api/bot/v1/channels/<int:cid>/messages")
+@bot_auth_required
+def bot_api_channel_messages(cid):
+    with connect() as c:
+        channel=c.execute(
+            "select server_id from server_channels where id=%s",
+            (cid,)
+        ).fetchone()
+        if not channel:
+            return jsonify(error="Channel not found"),404
+
+        sid=channel[0]
+        perms=bot_install_permissions(request.bot["id"],sid)
+        if "view_channels" not in perms or "read_messages" not in perms:
+            return jsonify(error="Bot lacks message read permissions"),403
+
+        rows=c.execute("""
+            select m.id,m.content,m.created_at,
+                   case
+                     when m.bot_id is not null then b.name
+                     when m.is_spookhook then m.hook_name
+                     else u.username
+                   end as username,
+                   m.bot_id
+            from messages m
+            join users u on u.id=m.user_id
+            left join vyntra_bots b on b.id=m.bot_id
+            where m.kind='server' and m.server_id=%s and m.channel=%s
+            order by m.created_at desc
+            limit 100
+        """,(sid,str(cid))).fetchall()
+
+    return jsonify(messages=[{
+        "id":r[0],
+        "content":r[1],
+        "created_at":r[2].isoformat(),
+        "username":r[3],
+        "is_bot":bool(r[4])
+    } for r in reversed(rows)])
+
+
+@app.post("/api/bot/v1/channels/<int:cid>/messages")
+@bot_auth_required
+def bot_api_send_message(cid):
+    d=request.get_json(silent=True) or {}
+    content=str(d.get("content","")).strip()
+    reply_to_id=d.get("reply_to_id")
+
+    if not content or len(content)>4000:
+        return jsonify(error="Message must be 1-4000 characters"),400
+
+    try:
+        reply_to_id=int(reply_to_id) if reply_to_id else None
+    except Exception:
+        reply_to_id=None
+
+    with connect() as c:
+        channel=c.execute(
+            "select server_id from server_channels where id=%s",
+            (cid,)
+        ).fetchone()
+        if not channel:
+            return jsonify(error="Channel not found"),404
+
+        sid=channel[0]
+        perms=bot_install_permissions(request.bot["id"],sid)
+
+        if "view_channels" not in perms or "send_messages" not in perms:
+            return jsonify(error="Bot lacks Send Messages permission"),403
+
+        if reply_to_id:
+            reply=c.execute("""
+                select 1
+                from messages
+                where id=%s and kind='server' and server_id=%s and channel=%s
+            """,(reply_to_id,sid,str(cid))).fetchone()
+            if not reply:
+                return jsonify(error="Reply target is not in this channel"),400
+
+        mid=c.execute("""
+            insert into messages(
+                user_id,content,kind,channel,server_id,reply_to_id,bot_id
+            )
+            values(%s,%s,'server',%s,%s,%s,%s)
+            returning id
+        """,(
+            request.bot["owner_id"],content,str(cid),sid,reply_to_id,request.bot["id"]
+        )).fetchone()[0]
+        c.commit()
+
+    return jsonify(id=mid)
+
+
+@app.delete("/api/bot/v1/messages/<int:mid>")
+@bot_auth_required
+def bot_api_delete_message(mid):
+    with connect() as c:
+        row=c.execute("""
+            select server_id,bot_id
+            from messages
+            where id=%s and kind='server'
+        """,(mid,)).fetchone()
+        if not row:
+            return jsonify(error="Message not found"),404
+
+        perms=bot_install_permissions(request.bot["id"],row[0])
+        owns=bool(row[1] and row[1]==request.bot["id"])
+
+        if not owns and "manage_messages" not in perms:
+            return jsonify(error="Bot lacks Manage Messages permission"),403
+
+        c.execute("delete from messages where id=%s",(mid,))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.post("/api/bot/v1/messages/<int:mid>/reactions")
+@bot_auth_required
+def bot_api_react(mid):
+    d=request.get_json(silent=True) or {}
+    emoji=str(d.get("emoji","")).strip()[:16]
+    allowed={"👍","❤️","😂","🔥","🎉","👻","💜","✅","❌"}
+    if emoji not in allowed:
+        return jsonify(error="Invalid reaction"),400
+
+    with connect() as c:
+        row=c.execute(
+            "select server_id from messages where id=%s and kind='server'",
+            (mid,)
+        ).fetchone()
+        if not row:
+            return jsonify(error="Message not found"),404
+
+        perms=bot_install_permissions(request.bot["id"],row[0])
+        if "add_reactions" not in perms:
+            return jsonify(error="Bot lacks Add Reactions permission"),403
+
+        # Bot reactions use the bot owner's user id plus bot identity isn't stored
+        # in the reaction table, so a bot can toggle one reaction per owner account.
+        existing=c.execute("""
+            select 1 from message_reactions
+            where message_id=%s and user_id=%s and emoji=%s
+        """,(mid,request.bot["owner_id"],emoji)).fetchone()
+
+        if existing:
+            c.execute("""
+                delete from message_reactions
+                where message_id=%s and user_id=%s and emoji=%s
+            """,(mid,request.bot["owner_id"],emoji))
+            added=False
+        else:
+            c.execute("""
+                insert into message_reactions(message_id,user_id,emoji)
+                values(%s,%s,%s)
+            """,(mid,request.bot["owner_id"],emoji))
+            added=True
+        c.commit()
+
+    return jsonify(ok=True,added=added)
+
 
 @app.get("/api/health")
 def health():
@@ -4330,6 +4977,261 @@ def notifications_read_chat():
 # ============================================================
 # SERVERS
 # ============================================================
+
+
+
+@app.get("/api/bots")
+@login_required
+def bots_list():
+    with connect() as c:
+        rows=c.execute("""
+            select id,public_id,name,description,avatar,requested_permissions,created_at,
+                   (select count(*) from bot_server_installs bi where bi.bot_id=b.id)
+            from vyntra_bots b
+            where owner_id=%s
+            order by created_at desc
+        """,(request.me["id"],)).fetchall()
+
+    base=request.host_url.rstrip("/")
+    return jsonify(bots=[{
+        "id":r[0],
+        "public_id":r[1],
+        "name":r[2],
+        "description":r[3],
+        "avatar":r[4],
+        "permissions":list(r[5] or []),
+        "created_at":r[6].isoformat(),
+        "server_count":r[7],
+        "invite_url":f"{base}/?bot_invite={r[1]}"
+    } for r in rows],permission_keys=BOT_PERMISSION_KEYS)
+
+
+@app.post("/api/bots")
+@login_required
+def bot_create():
+    d=request.get_json(silent=True) or {}
+    name=" ".join(str(d.get("name","")).strip().split())[:40]
+    description=str(d.get("description","")).strip()[:240]
+    avatar=str(d.get("avatar","")).strip()[:1000]
+    perms=sorted(normalize_bot_permissions(d.get("permissions") or []))
+
+    if len(name)<2:
+        return jsonify(error="Bot name must be at least 2 characters."),400
+
+    public_id=secrets.token_urlsafe(10).replace("-","").replace("_","")[:16]
+    token=create_bot_token()
+
+    with connect() as c:
+        bid=c.execute("""
+            insert into vyntra_bots(
+                owner_id,public_id,name,description,avatar,token_hash,requested_permissions
+            )
+            values(%s,%s,%s,%s,%s,%s,%s)
+            returning id
+        """,(
+            request.me["id"],public_id,name,description,avatar,
+            bot_token_hash(token),psycopg.types.json.Jsonb(perms)
+        )).fetchone()[0]
+        c.commit()
+
+    return jsonify(
+        id=bid,
+        public_id=public_id,
+        token=token,
+        invite_url=request.host_url.rstrip("/")+"/?bot_invite="+public_id
+    )
+
+
+@app.patch("/api/bots/<int:bid>")
+@login_required
+def bot_edit(bid):
+    d=request.get_json(silent=True) or {}
+    with connect() as c:
+        old=c.execute("""
+            select name,description,avatar,requested_permissions
+            from vyntra_bots
+            where id=%s and owner_id=%s
+        """,(bid,request.me["id"])).fetchone()
+        if not old:
+            return jsonify(error="Bot not found"),404
+
+        name=" ".join(str(d.get("name",old[0])).strip().split())[:40]
+        description=str(d.get("description",old[1])).strip()[:240]
+        avatar=str(d.get("avatar",old[2])).strip()[:1000]
+        raw=d.get("permissions",old[3] or [])
+        perms=sorted(normalize_bot_permissions(raw))
+
+        if len(name)<2:
+            return jsonify(error="Bot name must be at least 2 characters."),400
+
+        c.execute("""
+            update vyntra_bots
+            set name=%s,description=%s,avatar=%s,requested_permissions=%s
+            where id=%s and owner_id=%s
+        """,(name,description,avatar,psycopg.types.json.Jsonb(perms),bid,request.me["id"]))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.post("/api/bots/<int:bid>/reset-token")
+@login_required
+def bot_reset_token(bid):
+    token=create_bot_token()
+    with connect() as c:
+        exists=c.execute(
+            "select 1 from vyntra_bots where id=%s and owner_id=%s",
+            (bid,request.me["id"])
+        ).fetchone()
+        if not exists:
+            return jsonify(error="Bot not found"),404
+
+        c.execute(
+            "update vyntra_bots set token_hash=%s where id=%s",
+            (bot_token_hash(token),bid)
+        )
+        c.commit()
+
+    return jsonify(token=token)
+
+
+@app.delete("/api/bots/<int:bid>")
+@login_required
+def bot_delete(bid):
+    with connect() as c:
+        c.execute(
+            "delete from vyntra_bots where id=%s and owner_id=%s",
+            (bid,request.me["id"])
+        )
+        c.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/bots/invite/<public_id>")
+@login_required
+def bot_invite_info(public_id):
+    with connect() as c:
+        bot=c.execute("""
+            select id,public_id,name,description,avatar,requested_permissions
+            from vyntra_bots
+            where public_id=%s
+        """,(public_id,)).fetchone()
+        if not bot:
+            return jsonify(error="Bot invite not found"),404
+
+        servers=c.execute("""
+            select s.id,s.name,s.icon,
+                   exists(
+                     select 1 from bot_server_installs bi
+                     where bi.bot_id=%s and bi.server_id=s.id
+                   )
+            from servers s
+            join server_members sm on sm.server_id=s.id
+            where sm.user_id=%s
+            order by lower(s.name)
+        """,(bot[0],request.me["id"])).fetchall()
+
+    eligible=[]
+    for s in servers:
+        if can_install_bot_to_server(s[0],request.me["id"]):
+            eligible.append({
+                "id":s[0],
+                "name":s[1],
+                "icon":s[2],
+                "installed":bool(s[3])
+            })
+
+    return jsonify(
+        bot={
+            "id":bot[0],
+            "public_id":bot[1],
+            "name":bot[2],
+            "description":bot[3],
+            "avatar":bot[4],
+            "permissions":list(bot[5] or [])
+        },
+        servers=eligible
+    )
+
+
+@app.post("/api/bots/invite/<public_id>/install")
+@login_required
+def bot_install(public_id):
+    d=request.get_json(silent=True) or {}
+    try:
+        sid=int(d.get("server_id"))
+    except Exception:
+        return jsonify(error="Choose a server"),400
+
+    if not can_install_bot_to_server(sid,request.me["id"]):
+        return jsonify(error="You need server Admin permissions to add a bot."),403
+
+    with connect() as c:
+        bot=c.execute("""
+            select id,requested_permissions
+            from vyntra_bots
+            where public_id=%s
+        """,(public_id,)).fetchone()
+        if not bot:
+            return jsonify(error="Bot invite not found"),404
+
+        perms=sorted(normalize_bot_permissions(bot[1] or []))
+
+        c.execute("""
+            insert into bot_server_installs(
+                bot_id,server_id,installed_by,permissions
+            )
+            values(%s,%s,%s,%s)
+            on conflict(bot_id,server_id)
+            do update set
+                installed_by=excluded.installed_by,
+                permissions=excluded.permissions,
+                installed_at=now()
+        """,(bot[0],sid,request.me["id"],psycopg.types.json.Jsonb(perms)))
+        c.commit()
+
+    return jsonify(ok=True,server_id=sid)
+
+
+@app.delete("/api/servers/<int:sid>/bots/<int:bid>")
+@login_required
+def bot_uninstall(sid,bid):
+    if not can_install_bot_to_server(sid,request.me["id"]):
+        return jsonify(error="You need server Admin permissions to remove bots."),403
+
+    with connect() as c:
+        c.execute(
+            "delete from bot_server_installs where bot_id=%s and server_id=%s",
+            (bid,sid)
+        )
+        c.commit()
+    return jsonify(ok=True)
+
+
+@app.get("/api/servers/<int:sid>/bots")
+@login_required
+def server_bots_list(sid):
+    if not server_member(sid,request.me["id"]):
+        return jsonify(error="Not a server member"),403
+
+    with connect() as c:
+        rows=c.execute("""
+            select b.id,b.public_id,b.name,b.description,b.avatar,bi.permissions,bi.installed_at
+            from bot_server_installs bi
+            join vyntra_bots b on b.id=bi.bot_id
+            where bi.server_id=%s
+            order by lower(b.name)
+        """,(sid,)).fetchall()
+
+    return jsonify(bots=[{
+        "id":r[0],
+        "public_id":r[1],
+        "name":r[2],
+        "description":r[3],
+        "avatar":r[4],
+        "permissions":list(r[5] or []),
+        "installed_at":r[6].isoformat()
+    } for r in rows])
 
 
 @app.get("/api/servers/discover")
@@ -5105,11 +6007,17 @@ def messages_get():
 
             rows=c.execute("""
               select m.id,m.user_id,m.content,m.created_at,m.edited_at,
-                     case when m.is_spookhook then m.hook_name else u.username end,
-                     u.avatar,coalesce(author_sm.role,'member'),
-                     m.is_spookhook,m.reply_to_id
+                     case
+                       when m.bot_id is not null then b.name
+                       when m.is_spookhook then m.hook_name
+                       else u.username
+                     end,
+                     case when m.bot_id is not null then b.avatar else u.avatar end,
+                     case when m.bot_id is not null then 'bot' else coalesce(author_sm.role,'member') end,
+                     m.is_spookhook,m.reply_to_id,m.bot_id
               from messages m
               join users u on u.id=m.user_id
+              left join vyntra_bots b on b.id=m.bot_id
               left join server_members author_sm
                 on author_sm.server_id=m.server_id
                and author_sm.user_id=m.user_id
@@ -5219,6 +6127,7 @@ def messages_get():
             "avatar":r[6],
             "role":r[7],
             "is_spookhook":bool(r[8]),
+            "is_bot":bool(r[10]) if kind=="server" and len(r)>10 else False,
             "reactions":reaction_map.get(r[0],[]),
             "embed_url":extract_first_url(r[2]),
             "embed_allowed":True,
@@ -5365,6 +6274,10 @@ def messages_post():
         if "send_messages" not in effective_perms:return jsonify(error="Your role cannot talk in this channel"),403
         channel=str(channel)
     if kind=="dm":
+        try:
+            cid=int(cid)
+        except Exception:
+            return jsonify(error="Invalid chat"),400
         with connect() as c:
             if not c.execute("select 1 from chat_members where chat_id=%s and user_id=%s",(cid,request.me["id"])).fetchone():
                 return jsonify(error="Not a chat member"),403
@@ -5382,7 +6295,7 @@ def messages_post():
                 return jsonify(error="Reply target is not in this public channel."),400
             elif kind=="server" and (reply[2] != sid or str(reply[1]) != str(channel)):
                 return jsonify(error="Reply target is not in this server channel."),400
-            elif kind=="dm" and reply[3] != cid:
+            elif kind=="dm" and int(reply[3]) != int(cid):
                 return jsonify(error="Reply target is not in this chat."),400
 
         mid=c.execute("""
