@@ -119,6 +119,19 @@ create table if not exists owner_audit_log(
 create index if not exists owner_audit_log_created_idx
 on owner_audit_log(created_at desc);
 
+
+create table if not exists server_bans(
+ server_id bigint not null references servers(id) on delete cascade,
+ user_id bigint not null references users(id) on delete cascade,
+ banned_by bigint references users(id) on delete set null,
+ banned_until timestamptz,
+ created_at timestamptz not null default now(),
+ primary key(server_id,user_id)
+);
+
+create index if not exists server_bans_server_idx
+on server_bans(server_id,banned_until);
+
 create table if not exists server_join_requests(
  id bigserial primary key,
  server_id bigint not null references servers(id) on delete cascade,
@@ -501,6 +514,19 @@ def init_db():
                  updated_at timestamptz not null default now()
                 )
             """)
+
+            c.execute("""
+                create table if not exists server_bans(
+                 server_id bigint not null references servers(id) on delete cascade,
+                 user_id bigint not null references users(id) on delete cascade,
+                 banned_by bigint references users(id) on delete set null,
+                 banned_until timestamptz,
+                 created_at timestamptz not null default now(),
+                 primary key(server_id,user_id)
+                )
+            """)
+            c.execute("create index if not exists server_bans_server_idx on server_bans(server_id,banned_until)")
+
             c.execute("insert into site_settings(id) values(1) on conflict(id) do nothing")
 
             c.execute("alter table site_settings add column if not exists public_channels_locked boolean not null default false")
@@ -817,6 +843,88 @@ def staff_required(*roles):
             return fn(*args, **kwargs)
         return wrap
     return deco
+
+
+def active_server_ban(sid, uid, conn=None):
+    own_conn = conn is None
+    c = conn or connect()
+
+    try:
+        row = c.execute("""
+            select banned_until
+            from server_bans
+            where server_id=%s and user_id=%s
+        """, (sid, uid)).fetchone()
+
+        if not row:
+            return None
+
+        until = row[0]
+        now = datetime.now(timezone.utc)
+
+        if until is not None and until <= now:
+            c.execute(
+                "delete from server_bans where server_id=%s and user_id=%s",
+                (sid, uid)
+            )
+            if own_conn:
+                c.commit()
+            return None
+
+        return until
+    finally:
+        if own_conn:
+            c.close()
+
+
+def ban_server_user(sid, uid, banned_by, until, conn):
+    target = conn.execute("""
+        select role
+        from server_members
+        where server_id=%s and user_id=%s
+    """, (sid, uid)).fetchone()
+
+    if not target:
+        return False, "Member not found"
+
+    if target[0] == "owner":
+        return False, "The server owner cannot be banned"
+
+    conn.execute("""
+        insert into server_bans(server_id,user_id,banned_by,banned_until,created_at)
+        values(%s,%s,%s,%s,now())
+        on conflict(server_id,user_id)
+        do update set
+            banned_by=excluded.banned_by,
+            banned_until=excluded.banned_until,
+            created_at=now()
+    """, (sid, uid, banned_by, until))
+
+    conn.execute(
+        "delete from server_member_roles where server_id=%s and user_id=%s",
+        (sid, uid)
+    )
+
+    conn.execute("""
+        update server_join_requests
+        set status='denied'
+        where server_id=%s and user_id=%s and status='pending'
+    """, (sid, uid))
+
+    conn.execute(
+        "delete from server_members where server_id=%s and user_id=%s",
+        (sid, uid)
+    )
+
+    return True, None
+
+
+def unban_server_user(sid, uid, conn):
+    conn.execute(
+        "delete from server_bans where server_id=%s and user_id=%s",
+        (sid, uid)
+    )
+
 
 def server_member(sid, uid):
     with connect() as c:
@@ -3978,7 +4086,30 @@ async function saveInstalledBotPermissions(bid){
  }
 }
 
-async function serverAction(uid,action){try{await api("/api/server/member-action",{method:"POST",body:JSON.stringify({server_id:state.activeServer,user_id:uid,action,minutes:60})});await openServer(state.activeServer,state.channel);toast("Member updated")}catch(e){toast(e.message)}}
+async function serverAction(uid,action){
+ try{
+   const result=await api("/api/server/member-action",{
+     method:"POST",
+     body:JSON.stringify({
+       server_id:state.activeServer,
+       user_id:uid,
+       action,
+       minutes:60
+     })
+   });
+
+   await openServer(state.activeServer,state.channel);
+
+   if(action==="ban"&&result.removed_from_server){
+     toast("User banned and removed from the server");
+   }else{
+     toast("Member updated");
+   }
+
+ }catch(e){
+   toast(e.message);
+ }
+}
 function changeServerRole(uid){modalOpen("Change server role",`<form class="formGrid" onsubmit="saveServerRole(event,${uid})"><select id="serverRoleSelect" class="field"><option value="member">Member</option><option value="moderator">Moderator</option><option value="admin">Admin</option></select><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Save</button></div></form>`)}
 async function saveServerRole(e,uid){e.preventDefault();try{await api("/api/server/member-action",{method:"POST",body:JSON.stringify({server_id:state.activeServer,user_id:uid,action:"role",role:serverRoleSelect.value})});modalClose();await openServer(state.activeServer,state.channel)}catch(e){toast(e.message)}}
 async function showServerSettings(id){
@@ -3986,12 +4117,13 @@ async function showServerSettings(id){
    const d=await api("/api/servers/"+id+"/members");
    const s=state.serverInfo;
    modalOpen("Server settings",`<div class="formGrid"><div class="label">Server name</div><input id="serverSetName" class="field" value="${esc(s.name)}"><div class="label">Server picture URL</div><input id="serverSetIcon" class="field" value="${esc(s.icon||"")}"><div class="label">Server privacy</div><select id="serverPrivacyMode" class="field"><option value="public" ${s.privacy_mode==="public"?"selected":""}>Public — anyone can join</option><option value="public_approval" ${s.privacy_mode==="public_approval"?"selected":""}>Public + Owner Approval — join requests</option><option value="invite_only" ${s.privacy_mode==="invite_only"?"selected":""}>Invite Only — hidden from Discover</option><option value="private" ${s.privacy_mode==="private"?"selected":""}>Private — no joining</option></select><button class="primary" onclick="saveServerSettings(${id})">Save server settings</button></div>
-   <div class="card" style="margin-top:16px"><h3>Joining</h3><div class="muted">Members can only join this server themselves from Discover Servers.</div></div><div class="card"><div class="row between"><div><h3 style="margin:0">Join Requests</h3><div class="muted">Used when Server Privacy is set to Public + Owner Approval.</div></div><button class="ghost" onclick="loadJoinRequests(${id})">Refresh</button></div><div id="joinRequestsList" style="margin-top:10px">Loading...</div></div>
+   <div class="card" style="margin-top:16px"><h3>Joining</h3><div class="muted">Members can only join this server themselves from Discover Servers.</div></div><div class="card"><div class="row between"><div><h3 style="margin:0">Banned Users</h3><div class="muted">Banned users are removed from the server completely and cannot rejoin until the ban expires or you unban them.</div></div><button class="ghost" onclick="loadServerBans(${id})">Refresh</button></div><div id="serverBansList" style="margin-top:10px">Loading...</div></div><div class="card"><div class="row between"><div><h3 style="margin:0">Join Requests</h3><div class="muted">Used when Server Privacy is set to Public + Owner Approval.</div></div><button class="ghost" onclick="loadJoinRequests(${id})">Refresh</button></div><div id="joinRequestsList" style="margin-top:10px">Loading...</div></div>
    <div class="card"><div class="row between"><h3 style="margin:0">Custom Roles</h3>${hasServerPerm("manage_roles")?`<button class="primary" onclick="createCustomRole(${id})">＋ Role</button>`:""}</div><div style="margin-top:10px">${state.serverRoles.length?state.serverRoles.map(r=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(r.name)}</div><div class="listSub">${Object.entries(r.permissions||{}).filter(([k,v])=>v).length} enabled permission${Object.entries(r.permissions||{}).filter(([k,v])=>v).length===1?"":"s"}</div></div><button class="ghost" onclick="editCustomRole(${id},${r.id})">Edit Permissions</button><button class="danger" onclick="deleteCustomRole(${id},${r.id})">Delete</button></div>`).join(""):'<div class="muted">No custom roles yet.</div>'}</div>
    <div class="card"><h3>Members (${d.members.length})</h3>${d.members.map(m=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${esc(m.role)}</div></div>${m.role!=="owner"?`<button class="ghost" onclick="changeServerRoleFromSettings(${id},${m.id})">Staff Role</button><button class="ghost" onclick="manageMemberCustomRoles(${id},${m.id})">Custom Roles</button><button class="danger" onclick="removeServerMember(${id},${m.id})">Remove</button>`:""}</div>`).join("")}</div>
    <div class="card"><div class="row between"><div><h3 style="margin:0">Installed Bots</h3><div class="muted">Bots installed through Vyntra Bot invite links.</div></div><button class="ghost" onclick="loadServerBots(${id})">Refresh</button></div><div id="installedBotsList" style="margin-top:10px">Loading...</div></div>
    <div class="card"><h3>Danger zone</h3><button class="danger" onclick="deleteServer(${id})">Delete server</button></div>`);
    setTimeout(()=>loadJoinRequests(id),20);
+   setTimeout(()=>loadServerBans(id),25);
    setTimeout(()=>loadServerBots(id),30);
  }catch(e){toast(e.message)}
 }
@@ -4021,6 +4153,51 @@ async function removeServerBot(sid,bid){
    loadServerBots(sid);
  }catch(e){toast(e.message)}
 }
+
+
+async function loadServerBans(sid){
+ const el=document.getElementById("serverBansList");
+ if(!el)return;
+
+ try{
+   const d=await api(`/api/servers/${sid}/bans`);
+
+   el.innerHTML=d.bans.length
+     ?d.bans.map(b=>`
+       <div class="listItem">
+         <img class="avatar" src="${avatarSrc(b.avatar)}">
+         <div class="listMain">
+           <div class="listTitle">${esc(b.username)}</div>
+           <div class="listSub">
+             ${b.banned_until
+               ?`Banned until ${new Date(b.banned_until).toLocaleString()}`
+               :"Permanently banned"}
+             ${b.banned_by?` · by ${esc(b.banned_by)}`:""}
+           </div>
+         </div>
+         <button class="good" onclick="unbanServerUser(${sid},${b.user_id})">Unban</button>
+       </div>`).join("")
+     :`<div class="muted">No active server bans.</div>`;
+
+ }catch(e){
+   el.innerHTML=`<div class="muted">${esc(e.message)}</div>`;
+ }
+}
+
+async function unbanServerUser(sid,uid){
+ try{
+   await api(`/api/servers/${sid}/bans/${uid}`,{
+     method:"DELETE"
+   });
+
+   toast("User unbanned");
+   loadServerBans(sid);
+
+ }catch(e){
+   toast(e.message);
+ }
+}
+
 
 async function loadJoinRequests(sid){
  const el=document.getElementById("joinRequestsList");if(!el)return;
@@ -5303,14 +5480,30 @@ def bot_api_moderate_member(sid,uid):
     }[action]
 
     perms=bot_install_permissions(request.bot["id"],sid)
+
     if required not in perms:
-        return jsonify(error=f"Bot lacks {required.replace('_',' ').title()} permission"),403
+        return jsonify(
+            error=f"Bot lacks {required.replace('_',' ').title()} permission"
+        ),403
+
+    try:
+        mins=max(1,min(int(d.get("minutes") or 60),525600))
+    except Exception:
+        mins=60
+
+    until=datetime.now(timezone.utc)+timedelta(minutes=mins)
 
     with connect() as c:
-        target=c.execute(
-            "select role from server_members where server_id=%s and user_id=%s",
-            (sid,uid)
-        ).fetchone()
+        if action=="unban":
+            unban_server_user(sid,uid,c)
+            c.commit()
+            return jsonify(ok=True,action="unban")
+
+        target=c.execute("""
+            select role
+            from server_members
+            where server_id=%s and user_id=%s
+        """,(sid,uid)).fetchone()
 
         if not target:
             return jsonify(error="Member not found"),404
@@ -5318,26 +5511,36 @@ def bot_api_moderate_member(sid,uid):
         if target[0]=="owner":
             return jsonify(error="Cannot moderate the server owner"),403
 
-        if action in ("mute","ban"):
-            try:
-                mins=max(1,min(int(d.get("minutes") or 60),525600))
-            except Exception:
-                mins=60
-            until=datetime.now(timezone.utc)+timedelta(minutes=mins)
-
-            field="muted_until" if action=="mute" else "banned_until"
-            c.execute(
-                f"update server_members set {field}=%s where server_id=%s and user_id=%s",
-                (until,sid,uid)
+        if action=="ban":
+            ok,error=ban_server_user(
+                sid,uid,request.bot["owner_id"],until,c
             )
-            c.commit()
-            return jsonify(ok=True,action=action,until=until.isoformat())
 
-        field="muted_until" if action=="unmute" else "banned_until"
-        c.execute(
-            f"update server_members set {field}=null where server_id=%s and user_id=%s",
-            (sid,uid)
-        )
+            if not ok:
+                return jsonify(error=error),403
+
+            c.commit()
+
+            return jsonify(
+                ok=True,
+                action="ban",
+                removed_from_server=True,
+                until=until.isoformat()
+            )
+
+        if action=="mute":
+            c.execute("""
+                update server_members
+                set muted_until=%s
+                where server_id=%s and user_id=%s
+            """,(until,sid,uid))
+        else:
+            c.execute("""
+                update server_members
+                set muted_until=null
+                where server_id=%s and user_id=%s
+            """,(sid,uid))
+
         c.commit()
 
     return jsonify(ok=True,action=action)
@@ -5395,50 +5598,84 @@ def bot_api_unmute_member(sid,uid):
 @bot_auth_required
 def bot_api_ban_member(sid,uid):
     perms=bot_install_permissions(request.bot["id"],sid)
+
     if "ban_members" not in perms:
         return jsonify(error="Bot lacks Ban Members permission"),403
 
     d=request.get_json(silent=True) or {}
-    mins=max(1,min(int(d.get("minutes") or 525600),525600))
+
+    try:
+        mins=max(1,min(int(d.get("minutes") or 525600),525600))
+    except Exception:
+        mins=525600
+
     until=datetime.now(timezone.utc)+timedelta(minutes=mins)
 
     with connect() as c:
-        target=c.execute(
-            "select role from server_members where server_id=%s and user_id=%s",
-            (sid,uid)
-        ).fetchone()
-        if not target:
-            return jsonify(error="Member not found"),404
-        if target[0]=="owner":
-            return jsonify(error="Cannot ban the server owner"),403
+        ok,error=ban_server_user(
+            sid,uid,request.bot["owner_id"],until,c
+        )
 
-        c.execute("""
-            update server_members
-            set banned_until=%s
-            where server_id=%s and user_id=%s
-        """,(until,sid,uid))
+        if not ok:
+            return jsonify(
+                error=error
+            ),404 if error=="Member not found" else 403
+
         c.commit()
 
-    return jsonify(ok=True,banned_until=until.isoformat())
+    return jsonify(
+        ok=True,
+        removed_from_server=True,
+        banned_until=until.isoformat()
+    )
 
 
 @app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/unban")
 @bot_auth_required
 def bot_api_unban_member(sid,uid):
     perms=bot_install_permissions(request.bot["id"],sid)
+
+    if "ban_members" not in perms:
+        return jsonify(error="Bot lacks Ban Members permission"),403
+
+    with connect() as c:
+        unban_server_user(sid,uid,c)
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.get("/api/bot/v1/servers/<int:sid>/bans")
+@bot_auth_required
+def bot_api_bans(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+
     if "ban_members" not in perms:
         return jsonify(error="Bot lacks Ban Members permission"),403
 
     with connect() as c:
         c.execute("""
-            update server_members
-            set banned_until=null
-            where server_id=%s and user_id=%s
-        """,(sid,uid))
+            delete from server_bans
+            where server_id=%s
+              and banned_until is not null
+              and banned_until<=now()
+        """,(sid,))
+
+        rows=c.execute("""
+            select sb.user_id,u.username,sb.banned_until
+            from server_bans sb
+            join users u on u.id=sb.user_id
+            where sb.server_id=%s
+            order by lower(u.username)
+        """,(sid,)).fetchall()
+
         c.commit()
 
-    return jsonify(ok=True)
-
+    return jsonify(bans=[{
+        "user_id":r[0],
+        "username":r[1],
+        "banned_until":r[2].isoformat() if r[2] else None
+    } for r in rows])
 
 @app.patch("/api/bot/v1/servers/<int:sid>")
 @bot_auth_required
@@ -6284,14 +6521,20 @@ def server_join(sid):
             return jsonify(error="Server no longer exists"), 404
 
         existing = c.execute("""
-            select role,banned_until from server_members
+            select role from server_members
             where server_id=%s and user_id=%s
         """, (sid,request.me["id"])).fetchone()
 
         if existing:
-            if existing[1] and existing[1] > datetime.now(timezone.utc):
-                return jsonify(error="You are banned from this server"), 403
             return jsonify(ok=True, already_joined=True)
+
+        ban_until = active_server_ban(sid, request.me["id"], c)
+        if ban_until is not None:
+            return jsonify(
+                error="You are banned from this server.",
+                banned=True,
+                banned_until=ban_until.isoformat() if ban_until else None
+            ), 403
 
         mode = server[1]
 
@@ -6808,45 +7051,158 @@ def server_member_remove(sid,uid):
 @login_required
 def server_member_action():
     d=request.get_json(silent=True) or {}
-    sid=d.get("server_id");uid=d.get("user_id");action=d.get("action")
-    actor=server_member(sid,request.me["id"]);target=server_member(sid,uid)
-    if not actor or not target:
-        return jsonify(error="Server member not found"),404
-    if target["role"]=="owner":
-        return jsonify(error="The server owner cannot be moderated"),403
 
-    mins=max(1,min(int(d.get("minutes") or 60),525600))
+    try:
+        sid=int(d.get("server_id"))
+        uid=int(d.get("user_id"))
+    except Exception:
+        return jsonify(error="Invalid server or user"),400
+
+    action=d.get("action")
+    actor=server_member(sid,request.me["id"])
+
+    if not actor:
+        return jsonify(error="Server member not found"),404
+
+    try:
+        mins=max(1,min(int(d.get("minutes") or 60),525600))
+    except Exception:
+        mins=60
+
     until=datetime.now(timezone.utc)+timedelta(minutes=mins)
 
     with connect() as c:
+        if action=="unban":
+            if not has_server_permission(sid,request.me["id"],"ban_members"):
+                return jsonify(error="Ban Members permission required"),403
+
+            unban_server_user(sid,uid,c)
+            c.commit()
+            return jsonify(ok=True,unbanned=True)
+
+        target=c.execute("""
+            select role
+            from server_members
+            where server_id=%s and user_id=%s
+        """,(sid,uid)).fetchone()
+
+        if not target:
+            return jsonify(error="Server member not found"),404
+
+        if target[0]=="owner":
+            return jsonify(error="The server owner cannot be moderated"),403
+
         if action=="mute":
             if not has_server_permission(sid,request.me["id"],"mute_members"):
                 return jsonify(error="Mute Members permission required"),403
-            c.execute("update server_members set muted_until=%s where server_id=%s and user_id=%s",(until,sid,uid))
+
+            c.execute("""
+                update server_members
+                set muted_until=%s
+                where server_id=%s and user_id=%s
+            """,(until,sid,uid))
+
         elif action=="unmute":
             if not has_server_permission(sid,request.me["id"],"mute_members"):
                 return jsonify(error="Mute Members permission required"),403
-            c.execute("update server_members set muted_until=null where server_id=%s and user_id=%s",(sid,uid))
+
+            c.execute("""
+                update server_members
+                set muted_until=null
+                where server_id=%s and user_id=%s
+            """,(sid,uid))
+
         elif action=="ban":
             if not has_server_permission(sid,request.me["id"],"ban_members"):
                 return jsonify(error="Ban Members permission required"),403
-            c.execute("update server_members set banned_until=%s where server_id=%s and user_id=%s",(until,sid,uid))
-        elif action=="unban":
-            if not has_server_permission(sid,request.me["id"],"ban_members"):
-                return jsonify(error="Ban Members permission required"),403
-            c.execute("update server_members set banned_until=null where server_id=%s and user_id=%s",(sid,uid))
+
+            ok,error=ban_server_user(
+                sid,uid,request.me["id"],until,c
+            )
+
+            if not ok:
+                return jsonify(error=error),403
+
+            c.commit()
+
+            return jsonify(
+                ok=True,
+                banned=True,
+                removed_from_server=True,
+                banned_until=until.isoformat()
+            )
+
         elif action=="role":
             if not has_server_permission(sid,request.me["id"],"manage_roles"):
                 return jsonify(error="Manage Roles permission required"),403
+
             role=d.get("role")
+
             if role not in ("member","moderator","admin"):
                 return jsonify(error="Invalid role"),400
-            c.execute("update server_members set role=%s where server_id=%s and user_id=%s",(role,sid,uid))
+
+            c.execute("""
+                update server_members
+                set role=%s
+                where server_id=%s and user_id=%s
+            """,(role,sid,uid))
+
         else:
             return jsonify(error="Invalid action"),400
+
         c.commit()
+
     return jsonify(ok=True)
 
+
+
+@app.get("/api/servers/<int:sid>/bans")
+@login_required
+def server_bans_get(sid):
+    if not has_server_permission(sid,request.me["id"],"ban_members"):
+        return jsonify(error="Ban Members permission required"),403
+
+    with connect() as c:
+        c.execute("""
+            delete from server_bans
+            where server_id=%s
+              and banned_until is not null
+              and banned_until<=now()
+        """,(sid,))
+
+        rows=c.execute("""
+            select sb.user_id,u.username,u.avatar,sb.banned_until,
+                   sb.created_at,actor.username
+            from server_bans sb
+            join users u on u.id=sb.user_id
+            left join users actor on actor.id=sb.banned_by
+            where sb.server_id=%s
+            order by sb.created_at desc
+        """,(sid,)).fetchall()
+
+        c.commit()
+
+    return jsonify(bans=[{
+        "user_id":r[0],
+        "username":r[1],
+        "avatar":r[2],
+        "banned_until":r[3].isoformat() if r[3] else None,
+        "created_at":r[4].isoformat(),
+        "banned_by":r[5]
+    } for r in rows])
+
+
+@app.delete("/api/servers/<int:sid>/bans/<int:uid>")
+@login_required
+def server_ban_remove(sid,uid):
+    if not has_server_permission(sid,request.me["id"],"ban_members"):
+        return jsonify(error="Ban Members permission required"),403
+
+    with connect() as c:
+        unban_server_user(sid,uid,c)
+        c.commit()
+
+    return jsonify(ok=True)
 
 @app.get("/api/servers/<int:sid>/join-requests")
 @login_required
@@ -6887,10 +7243,14 @@ def server_join_request_decide(sid,rid):
             return jsonify(error="Join request not found"),404
 
         if decision=="accept":
+            ban_until = active_server_ban(sid, jr[0], c)
+            if ban_until is not None:
+                return jsonify(error="That user is currently banned from this server."),403
+
             c.execute("""
                 insert into server_members(server_id,user_id,role)
                 values(%s,%s,'member')
-                on conflict(server_id,user_id) do update set banned_until=null
+                on conflict(server_id,user_id) do nothing
             """,(sid,jr[0]))
             c.execute("update server_join_requests set status='accepted' where id=%s",(rid,))
         else:
@@ -7261,14 +7621,20 @@ def invite_join(code):
             return jsonify(error="This server is currently private."),403
 
         existing = c.execute("""
-            select role,banned_until from server_members
+            select role from server_members
             where server_id=%s and user_id=%s
         """,(sid,request.me["id"])).fetchone()
 
         if existing:
-            if existing[1] and existing[1] > datetime.now(timezone.utc):
-                return jsonify(error="You are banned from this server"),403
             return jsonify(ok=True,server_id=sid,already_joined=True)
+
+        ban_until = active_server_ban(sid, request.me["id"], c)
+        if ban_until is not None:
+            return jsonify(
+                error="You are banned from this server.",
+                banned=True,
+                banned_until=ban_until.isoformat() if ban_until else None
+            ),403
 
         if mode == "public_approval":
             c.execute("""
