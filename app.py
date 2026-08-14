@@ -3354,6 +3354,142 @@ body.iphone11PreviewMode{
   }
 }
 
+
+/* ============================================================
+   VYNTRA STRONG UNREAD INDICATORS
+   ============================================================ */
+.unreadDot{
+  width:7px;
+  height:7px;
+  min-width:7px;
+  border-radius:50%;
+  background:#ffffff;
+  box-shadow:0 0 8px rgba(255,255,255,.35);
+  display:inline-block;
+}
+.sideBtn.hasUnread{
+  color:#f4eef8;
+  font-weight:900;
+}
+.sideBtn.hasUnread .navLabel{
+  color:#ffffff;
+  font-weight:900;
+}
+.sideBtn > .unreadDot{
+  margin-right:1px;
+}
+.channelBtn.hasUnread{
+  color:#f4eef8;
+  font-weight:900;
+  background:rgba(255,255,255,.025);
+}
+.channelBtn.hasUnread .channelLabel{
+  color:#ffffff;
+  font-weight:900;
+}
+.channelBtn > .unreadDot{
+  margin-right:6px;
+}
+.serverBtn.hasUnread{
+  transform:translateX(2px);
+}
+.serverBtn > .unreadDot{
+  position:absolute;
+  left:-8px;
+  top:50%;
+  width:6px;
+  height:22px;
+  border-radius:0 6px 6px 0;
+  transform:translateY(-50%);
+  background:#ffffff;
+  z-index:2;
+}
+.listTitle.hasUnread{
+  color:#ffffff;
+  font-weight:900;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.listTitle.hasUnread > .unreadDot{
+  background:#a855f7;
+}
+@media(max-width:720px){
+  .sideBtn.hasUnread,
+  .channelBtn.hasUnread{
+    font-weight:900;
+  }
+  .unreadDot{
+    width:6px;
+    height:6px;
+    min-width:6px;
+  }
+}
+
+
+/* ============================================================
+   VYNTRA UNREAD EXACT UI FIX
+   ============================================================ */
+.sideBtn.hasUnread,
+.serverBtn.hasUnread,
+.channelBtn.hasUnread{
+  position:relative;
+  color:#f5eefb!important;
+  font-weight:900!important;
+}
+.sideBtn.hasUnread .navLabel,
+.serverBtn.hasUnread .serverNameLabel,
+.channelBtn.hasUnread .channelLabel{
+  color:#fff!important;
+  font-weight:900!important;
+}
+.sideBtn.hasUnread::before{
+  content:"";
+  position:absolute;
+  left:1px;
+  top:50%;
+  width:3px;
+  height:20px;
+  transform:translateY(-50%);
+  border-radius:0 5px 5px 0;
+  background:#fff;
+}
+.sideBtn > .unreadDot{
+  display:none;
+}
+.serverBtn > .unreadDot{
+  position:absolute;
+  left:1px;
+  top:50%;
+  width:3px;
+  min-width:3px;
+  height:24px;
+  transform:translateY(-50%);
+  border-radius:0 5px 5px 0;
+  background:#fff;
+}
+.channelBtn > .unreadDot{
+  width:6px;
+  height:6px;
+  min-width:6px;
+  margin-right:6px;
+  background:#fff;
+}
+.mobilebar button.hasUnread{
+  color:#fff!important;
+  font-weight:900!important;
+}
+.mobilebar button > .unreadDot{
+  display:block!important;
+  position:absolute;
+  right:9px;
+  top:5px;
+  width:6px;
+  height:6px;
+  min-width:6px;
+  background:#a855f7;
+}
+
 </style>
 </head>
 <body>
@@ -3484,9 +3620,9 @@ function sidebar(){
  <div class="brand"><div class="brandLogo"><img src="/static/spookchat_pfp.png"></div>VYN<span>TRA</span></div>
  <div class="sideScroll">
    <div class="sectionTitle">Home</div>
-   <button class="sideBtn ${state.view==="public"&&state.channel==="chat1"?"active":""}" onclick="openPublic('chat1')"><span class="iconBox">#</span>Chat 1</button>
-   <button class="sideBtn ${state.view==="public"&&state.channel==="chat2"?"active":""}" onclick="openPublic('chat2')"><span class="iconBox">#</span>Chat 2</button>
-   <button class="sideBtn ${state.view==="friends"?"active":""}" onclick="showFriendsPage()"><span class="iconBox">👥</span>Friends <span id="friendsUnreadSide" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>
+   <button class="sideBtn ${state.view==="public"&&state.channel==="chat1"?"active":""}${unreadClass(unreadCountFor("public","chat1"))}" data-unread-scope="public" data-channel="chat1" onclick="openPublic('chat1')">${unreadDot(unreadCountFor("public","chat1"))}<span class="iconBox">#</span><span class="navLabel">Chat 1</span>${badgeHtml(unreadCountFor("public","chat1"))}</button>
+   <button class="sideBtn ${state.view==="public"&&state.channel==="chat2"?"active":""}${unreadClass(unreadCountFor("public","chat2"))}" data-unread-scope="public" data-channel="chat2" onclick="openPublic('chat2')">${unreadDot(unreadCountFor("public","chat2"))}<span class="iconBox">#</span><span class="navLabel">Chat 2</span>${badgeHtml(unreadCountFor("public","chat2"))}</button>
+   <button class="sideBtn ${state.view==="friends"?"active":""}${unreadClass(unreadCountFor("friends"))}" data-unread-scope="friends" onclick="showFriendsPage()">${unreadDot(unreadCountFor("friends"))}<span class="iconBox">👥</span><span class="navLabel">Friends</span>${badgeHtml(unreadCountFor("friends"))}</button>
    <button class="sideBtn" onclick="showNotifications()"><span class="iconBox">🔔</span>Notifications <span id="notificationsUnreadSide" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>
    <button class="sideBtn" onclick="groupCreate()"><span class="iconBox">＋</span>New Group</button>
    ${isStaff?`<button class="sideBtn ${state.view==="staff"?"active":""}" onclick="showStaff()"><span class="iconBox">🛡</span>Moderation</button>`:""}${state.profile.global_role==="owner"?`<button class="sideBtn ${state.view==="owner"?"active":""}" onclick="showOwnerPanel()"><span class="iconBox">👑</span>Owner Control</button>`:""}
@@ -3496,10 +3632,12 @@ function sidebar(){
    <button class="sideBtn ${state.view==="discover"?"active":""}" onclick="showServerDiscovery()"><span class="iconBox">🔎</span>Discover Servers</button>
 
    <div class="sectionTitle"><span>Your Servers</span><button class="roundBtn" style="width:27px;height:27px" onclick="serverCreate()">＋</button></div>
-   ${state.servers.map(s=>`<button class="serverBtn ${state.activeServer==s.id?"active":""}" onclick="openServer(${s.id},'chat')">
+   ${state.servers.map(s=>{const uc=unreadCountFor("server",s.id);return `<button class="serverBtn ${state.activeServer==s.id?"active":""}${unreadClass(uc)}" data-unread-scope="server" data-server-id="${s.id}" onclick="openServer(${s.id},'chat')">
+      ${unreadDot(uc)}
       <span class="serverIcon">${s.icon?`<img src="${esc(s.icon)}" onerror="this.remove()">`:esc((s.name||"S")[0].toUpperCase())}</span>
-      <span style="min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(s.name)}</span><span class="badge">${s.member_count}</span>
-   </button>`).join("")}
+      <span class="serverNameLabel" style="min-width:0;overflow:hidden;text-overflow:ellipsis">${esc(s.name)}</span>
+      ${badgeHtml(uc,"serverUnreadBadge")}<span class="badge">${s.member_count}</span>
+   </button>`}).join("")}
  </div>
  <div class="meBox">
    <img class="meAvatar" src="${avatarSrc(state.profile.avatar)}" onerror="this.style.visibility='hidden'">
@@ -3511,12 +3649,11 @@ function sidebar(){
 
 function mobilebar(){
  return `<nav class="mobilebar">
-   <button class="${state.view==="public"||state.view==="dm"?"active":""}" onclick="openPublic('chat1')">
-     <span class="mobileNavIcon">✦</span><span>Home</span>
+   <button class="${state.view==="public"||state.view==="dm"?"active":""}${unreadClass(unreadCountFor("public","chat1")+unreadCountFor("public","chat2"))}" data-unread-scope="mobile-public-total" onclick="openPublic('chat1')">
+     ${unreadDot(unreadCountFor("public","chat1")+unreadCountFor("public","chat2"))}<span class="mobileNavIcon">✦</span><span>Home</span>${badgeHtml(unreadCountFor("public","chat1")+unreadCountFor("public","chat2"))}
    </button>
-   <button class="${state.view==="friends"?"active":""}" onclick="showFriendsPage()">
-     <span class="mobileNavIcon">♧</span><span>Friends</span>
-     <span id="friendsUnreadMobile" class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span>
+   <button class="${state.view==="friends"?"active":""}${unreadClass(unreadCountFor("friends"))}" data-unread-scope="friends" onclick="showFriendsPage()">
+     ${unreadDot(unreadCountFor("friends"))}<span class="mobileNavIcon">♧</span><span>Friends</span>${badgeHtml(unreadCountFor("friends"))}
    </button>
    <button class="mobileNavCenter ${state.view==="discover"||state.view==="server"?"active":""}" onclick="showMobileServerSheet()">
      <span class="mobileNavOrb">◈</span><span>Spaces</span>
@@ -3630,6 +3767,34 @@ function applyIPhone11PreviewMode(){
 }
 
 
+
+function unreadClass(count){
+ return Number(count||0)>0?" hasUnread":"";
+}
+
+function unreadDot(count){
+ return Number(count||0)>0?`<span class="unreadDot" aria-hidden="true"></span>`:"";
+}
+
+function unreadCountFor(type,a,b=null){
+ if(type==="public"){
+   return Number(state.unreads.public?.[String(a)]?.count||0);
+ }
+ if(type==="friends"){
+   return Number(state.unreads.friends_total||0);
+ }
+ if(type==="server"){
+   return Number(state.unreads.server_totals?.[String(a)]||0);
+ }
+ if(type==="server-channel"){
+   return Number(state.unreads.servers?.[String(a)]?.[String(b)]?.count||0);
+ }
+ if(type==="dm"){
+   return Number(state.unreads.dms?.[String(a)]?.count||0);
+ }
+ return 0;
+}
+
 function badgeHtml(count,extraClass=""){
  count=Number(count||0);
  if(count<=0)return "";
@@ -3654,6 +3819,31 @@ function currentReadPayload(){
    };
  }
  return null;
+}
+
+
+function clearUnreadLocal(kind,a,b=null){
+ if(kind==="public"){
+   if(state.unreads.public)delete state.unreads.public[String(a)];
+ }else if(kind==="dm"){
+   if(state.unreads.dms)delete state.unreads.dms[String(a)];
+   state.unreads.friends_total=Object.values(state.unreads.dms||{}).reduce((n,v)=>n+Number(v?.count||0),0);
+ }else if(kind==="server-channel"){
+   const sid=String(a),cid=String(b);
+   if(state.unreads.servers?.[sid])delete state.unreads.servers[sid][cid];
+   const total=Object.values(state.unreads.servers?.[sid]||{}).reduce((n,v)=>n+Number(v?.count||0),0);
+   if(state.unreads.server_totals){
+     if(total>0)state.unreads.server_totals[sid]=total;
+     else delete state.unreads.server_totals[sid];
+   }
+ }
+
+ state.unreads.total=
+   Object.values(state.unreads.public||{}).reduce((n,v)=>n+Number(v?.count||0),0)+
+   Object.values(state.unreads.dms||{}).reduce((n,v)=>n+Number(v?.count||0),0)+
+   Object.values(state.unreads.server_totals||{}).reduce((n,v)=>n+Number(v||0),0);
+
+ updateUnreadBadges();
 }
 
 async function markCurrentConversationRead(){
@@ -3779,6 +3969,8 @@ function updateUnreadBadges(){
 
    if(type==="public"){
      count=state.unreads.public?.[el.dataset.channel]?.count||0;
+   }else if(type==="mobile-public-total"){
+     count=unreadCountFor("public","chat1")+unreadCountFor("public","chat2");
    }else if(type==="friends"){
      count=state.unreads.friends_total||0;
    }else if(type==="server"){
@@ -3789,26 +3981,38 @@ function updateUnreadBadges(){
      count=state.unreads.dms?.[el.dataset.chatId]?.count||0;
    }
 
-   let badge=el.querySelector(".unreadBadge");
+   el.classList.toggle("hasUnread",Number(count)>0);
 
-   if(count>0){
+   let dot=el.querySelector(":scope > .unreadDot");
+
+   if(Number(count)>0){
+     if(!dot){
+       dot=document.createElement("span");
+       dot.className="unreadDot";
+       el.insertBefore(dot,el.firstChild);
+     }
+   }else if(dot){
+     dot.remove();
+   }
+
+   let badge=el.querySelector(":scope > .unreadBadge");
+
+   if(Number(count)>0){
      if(!badge){
        badge=document.createElement("span");
        badge.className="unreadBadge";
        el.appendChild(badge);
      }
-     badge.textContent=count>99?"99+":String(count);
+     badge.textContent=Number(count)>99?"99+":String(count);
    }else if(badge){
      badge.remove();
    }
  });
 
- // Browser/app title
  document.title=state.unreads.total>0
    ?`(${state.unreads.total}) VYNTRA`
    :"VYNTRA";
 }
-
 async function requestSystemNotifications(){
  if(!("Notification" in window)){
    toast("Notifications are not supported by this browser.");
@@ -3918,6 +4122,7 @@ function renderChat(){
  state.poll=setInterval(loadMessages,2000);
 }
 function openPublic(c){
+ clearUnreadLocal("public",c);
  state.view="public";
  state.channel=c;
  state.activeServer=null;
@@ -4787,8 +4992,9 @@ async function startDM(uid){
    toast(e.message);
  }
 }
-function drawChats(list){chatList.innerHTML=list.length?list.map(c=>`<button class="sideBtn" data-unread-scope="dm" data-chat-id="${c.id}" onclick="openChat(${c.id})"><span class="iconBox">${c.kind==="group"?"👥":"💬"}</span>${esc(c.display_name)}</button>`).join(""):`<div class="muted">No DMs or groups yet.</div>`}
+function drawChats(list){chatList.innerHTML=list.length?list.map(c=>{const uc=unreadCountFor("dm",c.id);return `<button class="sideBtn ${unreadClass(uc)}" data-unread-scope="dm" data-chat-id="${c.id}" onclick="openChat(${c.id})">${unreadDot(uc)}<span class="iconBox">${c.kind==="group"?"👥":"💬"}</span><span class="navLabel">${esc(c.display_name)}</span>${badgeHtml(uc)}</button>`}).join(""):`<div class="muted">No DMs or groups yet.</div>`}
 async function openChat(id){
+ clearUnreadLocal("dm",id);
  state.view="dm";
  state.activeChat=id;
  state.activeServer=null;
@@ -4889,6 +5095,10 @@ async function openServer(id,ch=null){
        !Array.isArray(m.visible_channel_ids) ||
        m.visible_channel_ids.includes(Number(state.channel))
      );
+   }
+
+   if(state.channel){
+     clearUnreadLocal("server-channel",wantedServer,state.channel);
    }
 
    state.lastMessageSignature="";
@@ -5059,7 +5269,7 @@ function renderServer(){
    <div class="serverChannelRail">
      <div class="sectionTitle serverChannelTitle"><span>Channels</span>${hasServerPerm("manage_channels")?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
      <div class="serverChannelButtons">
-       ${state.serverChannels.map(c=>`<div class="mobileChannelWrap"><button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" data-unread-scope="server-channel" data-server-id="${s.id}" data-channel="${c.id}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}${badgeHtml(state.unreads.servers?.[String(s.id)]?.[String(c.id)]?.count)}</button>${hasServerPerm("manage_channels")?`<button class="mobileChannelEditBtn" onclick="event.stopPropagation();channelSettings(${c.id})" title="Edit channel">⚙</button>`:""}</div>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
+       ${state.serverChannels.map(c=>`<div class="mobileChannelWrap"><button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}${unreadClass(unreadCountFor("server-channel",s.id,c.id))}" data-unread-scope="server-channel" data-server-id="${s.id}" data-channel="${c.id}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${unreadDot(unreadCountFor("server-channel",s.id,c.id))}<span class="channelLabel">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</span>${badgeHtml(unreadCountFor("server-channel",s.id,c.id))}</button>${hasServerPerm("manage_channels")?`<button class="mobileChannelEditBtn" onclick="event.stopPropagation();channelSettings(${c.id})" title="Edit channel">⚙</button>`:""}</div>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
      </div>
    </div>
    <div class="serverConversation">
@@ -5373,7 +5583,7 @@ async function saveServerSettings(id){try{await api("/api/servers/"+id,{method:"
 function changeServerRoleFromSettings(id,uid){changeServerRole(uid)}
 async function removeServerMember(id,uid){if(!confirm("Remove this member from the server?"))return;try{await api(`/api/servers/${id}/members/${uid}`,{method:"DELETE"});modalClose();await openServer(id,state.channel);showServerSettings(id)}catch(e){toast(e.message)}}
 async function deleteServer(id){if(!confirm("Permanently delete this server and all of its messages?"))return;try{await api("/api/servers/"+id,{method:"DELETE"});modalClose();state.activeServer=null;state.serverInfo=null;state.servers=(await api("/api/servers")).servers;openPublic("chat1")}catch(e){toast(e.message)}}
-function showServersMobile(){modalOpen("Your servers",state.servers.map(s=>`<button class="serverBtn" onclick="modalClose();openServer(${s.id},'chat')"><span class="serverIcon">${s.icon?`<img src="${esc(s.icon)}">`:esc(s.name[0])}</span>${esc(s.name)}<span class="badge">${s.member_count}</span></button>`).join("")||"<div class='muted'>No servers yet.</div>")}
+function showServersMobile(){modalOpen("Your servers",state.servers.map(s=>{const uc=unreadCountFor("server",s.id);return `<button class="serverBtn ${unreadClass(uc)}" data-unread-scope="server" data-server-id="${s.id}" onclick="modalClose();openServer(${s.id},'chat')">${unreadDot(uc)}<span class="serverIcon">${s.icon?`<img src="${esc(s.icon)}">`:esc(s.name[0])}</span><span class="serverNameLabel">${esc(s.name)}</span>${badgeHtml(uc)}<span class="badge">${s.member_count}</span></button>`}).join("")||"<div class='muted'>No servers yet.</div>")}
 
 function showSettings(){state.view="settings";state.activeServer=null;renderApp()}
 function renderSettings(){
