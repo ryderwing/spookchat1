@@ -1,4 +1,5 @@
 import os
+import base64
 import secrets
 import hashlib
 import html as html_lib
@@ -17,7 +18,7 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=True,
-    MAX_CONTENT_LENGTH=1 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=4 * 1024 * 1024,
     PERMANENT_SESSION_LIFETIME=timedelta(days=7),
 )
 
@@ -256,6 +257,7 @@ create table if not exists messages(
  hook_name text not null default '',
  reply_to_id bigint references messages(id) on delete set null,
  bot_id bigint references vyntra_bots(id) on delete set null,
+ image_data text not null default '',
  created_at timestamptz not null default now()
 );
 
@@ -405,6 +407,7 @@ def init_db():
             c.execute("alter table messages add column if not exists bot_id bigint references vyntra_bots(id) on delete set null")
 
             c.execute("alter table messages add column if not exists reply_to_id bigint references messages(id) on delete set null")
+            c.execute("alter table messages add column if not exists image_data text not null default '';")
             c.execute("create index if not exists messages_reply_idx on messages(reply_to_id)")
 
             c.execute("alter table server_roles add column if not exists permissions jsonb not null default '{}'::jsonb")
@@ -748,6 +751,46 @@ def bot_install_permissions(bot_id,sid):
     return perms
 
 
+
+ALLOWED_IMAGE_PREFIXES = (
+    "data:image/jpeg;base64,",
+    "data:image/png;base64,",
+    "data:image/webp;base64,",
+    "data:image/gif;base64,"
+)
+
+def validate_message_image(value):
+    value=str(value or "").strip()
+
+    if not value:
+        return ""
+
+    prefix=next(
+        (p for p in ALLOWED_IMAGE_PREFIXES if value.startswith(p)),
+        None
+    )
+
+    if not prefix:
+        raise ValueError("Only JPEG, PNG, WEBP, and GIF images are supported.")
+
+    encoded=value[len(prefix):]
+
+    # Client-side images are compressed first, but enforce a hard
+    # backend limit too so a message cannot be used to flood the DB.
+    if len(encoded) > 2_400_000:
+        raise ValueError("Image is too large.")
+
+    try:
+        raw=base64.b64decode(encoded,validate=True)
+    except Exception:
+        raise ValueError("Invalid image data.")
+
+    if len(raw) > 1_800_000:
+        raise ValueError("Image is too large.")
+
+    return value
+
+
 def client_ip():
     # Vercel supplies x-forwarded-for. We only use the first IP inserted by the edge.
     forwarded = request.headers.get("x-forwarded-for", "")
@@ -926,15 +969,57 @@ def unban_server_user(sid, uid, conn):
     )
 
 
+
+_GLOBAL_OWNER_CACHE={}
+
+def is_global_owner(uid):
+    now=time.monotonic()
+    cached=_GLOBAL_OWNER_CACHE.get(uid)
+
+    if cached and now-cached[0] < 10:
+        return cached[1]
+
+    with connect() as c:
+        row=c.execute(
+            "select global_role from users where id=%s",
+            (uid,)
+        ).fetchone()
+
+    result=bool(row and row[0]=="owner")
+    _GLOBAL_OWNER_CACHE[uid]=(now,result)
+
+    if len(_GLOBAL_OWNER_CACHE)>100:
+        _GLOBAL_OWNER_CACHE.clear()
+
+    return result
+
 def server_member(sid, uid):
+    # The global VYNTRA owner can manage every server without needing
+    # to join it as a normal server member.
+    if is_global_owner(uid):
+        return {
+            "role":"owner",
+            "banned_until":None,
+            "muted_until":None,
+            "joined_at":None,
+            "global_owner_override":True
+        }
+
     with connect() as c:
         r = c.execute("""
             select role,banned_until,muted_until,joined_at
             from server_members where server_id=%s and user_id=%s
         """, (sid, uid)).fetchone()
+
     if not r:
         return None
-    return {"role": r[0], "banned_until": r[1], "muted_until": r[2], "joined_at": r[3]}
+
+    return {
+        "role":r[0],
+        "banned_until":r[1],
+        "muted_until":r[2],
+        "joined_at":r[3]
+    }
 
 def server_level(role):
     return {"member":0, "moderator":1, "admin":2, "owner":3}.get(role, -1)
@@ -1063,6 +1148,18 @@ def server_custom_roles(sid, uid):
 
 def channel_effective_permissions(sid,channel_id,uid):
     """Return (server_member_dict, effective_permission_set) using one DB connection."""
+    if is_global_owner(uid):
+        return (
+            {
+                "role":"owner",
+                "banned_until":None,
+                "muted_until":None,
+                "joined_at":None,
+                "global_owner_override":True
+            },
+            set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)|{"delete_server"}
+        )
+
     with connect() as c:
         sm_row=c.execute("""
             select role,banned_until,muted_until,joined_at
@@ -2883,6 +2980,288 @@ body.theme-light .replyBar{
   user-select:none;
 }
 
+
+/* ============================================================
+   VYNTRA MOBILE CONTEXT BUTTON + PHOTO MESSAGES
+   ============================================================ */
+.mobileContextBtn{
+  display:none;
+  border:0;
+  background:transparent;
+  color:#8f8599;
+  min-width:34px;
+  height:30px;
+  border-radius:9px;
+  cursor:pointer;
+  font-size:15px;
+  font-weight:900;
+}
+.mobileContextBtn:hover{
+  background:rgba(255,255,255,.055);
+  color:#d2c8dc;
+}
+.photoSendBtn{
+  width:38px;
+  min-width:38px;
+  height:38px;
+  border-radius:11px;
+  border:1px solid rgba(255,255,255,.07);
+  background:#181120;
+  color:#c89aff;
+  cursor:pointer;
+  font-size:17px;
+}
+.pendingPhotoPreview{
+  display:flex;
+  align-items:center;
+  gap:10px;
+  margin:0 18px -7px;
+  padding:8px 10px;
+  border:1px solid rgba(168,85,247,.20);
+  border-bottom:0;
+  border-radius:13px 13px 0 0;
+  background:#16101e;
+}
+.pendingPhotoPreview img{
+  width:50px;
+  height:50px;
+  object-fit:cover;
+  border-radius:9px;
+}
+.messagePhotoButton{
+  display:block;
+  max-width:min(520px,100%);
+  border:0;
+  background:transparent;
+  padding:0;
+  margin:7px 0 2px;
+  cursor:pointer;
+  border-radius:14px;
+  overflow:hidden;
+}
+.messagePhoto{
+  display:block;
+  max-width:100%;
+  max-height:440px;
+  object-fit:contain;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,.07);
+}
+.photoViewer{
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  max-height:78dvh;
+}
+.photoViewer img{
+  display:block;
+  max-width:100%;
+  max-height:76dvh;
+  object-fit:contain;
+  border-radius:13px;
+}
+.msg{
+  position:relative;
+}
+.memberRow{
+  position:relative;
+}
+@media(max-width:720px){
+  .mobileContextBtn{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+  }
+  .messageContextBtn{
+    position:absolute;
+    right:5px;
+    top:7px;
+  }
+  .memberContextBtn{
+    margin-left:auto;
+    flex:0 0 34px;
+  }
+  .msg{
+    padding-right:40px!important;
+    -webkit-touch-callout:none;
+    user-select:none;
+  }
+  .msg .text{
+    user-select:none;
+    -webkit-user-select:none;
+  }
+  .memberRow{
+    -webkit-touch-callout:none;
+    user-select:none;
+  }
+  .photoSendBtn{
+    width:36px;
+    min-width:36px;
+    height:36px;
+  }
+  .pendingPhotoPreview{
+    margin:0 8px -5px;
+  }
+  .messagePhoto{
+    max-height:54dvh;
+  }
+}
+
+
+/* ============================================================
+   VYNTRA MOBILE SERVER FEATURE PARITY
+   ============================================================ */
+.mobileServerQuickBar{
+  display:none;
+}
+.mobileChannelWrap{
+  display:block;
+}
+.mobileChannelEditBtn{
+  display:none;
+}
+.mobileServerToolGrid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:9px;
+}
+.mobileServerTool{
+  min-height:88px;
+  border-radius:15px;
+  border:1px solid rgba(255,255,255,.07);
+  background:#15101d;
+  color:#eee7f4;
+  padding:12px;
+  text-align:left;
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+  cursor:pointer;
+}
+.mobileServerTool b{
+  font-size:13px;
+}
+.mobileServerTool span{
+  color:#958b9f;
+  font-size:11px;
+  line-height:1.35;
+}
+.mobileServerToolWide{
+  grid-column:1/-1;
+}
+.ownerMobileTestCard{
+  border-color:rgba(168,85,247,.24);
+  background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(17,13,24,.7));
+}
+.iphone11PreviewMode::after{
+  content:"iPhone 11 Preview · 414 × 896";
+  position:fixed;
+  top:4px;
+  left:50%;
+  transform:translateX(-50%);
+  z-index:1000;
+  background:rgba(14,10,20,.88);
+  border:1px solid rgba(168,85,247,.25);
+  color:#bda8cd;
+  padding:3px 8px;
+  border-radius:999px;
+  font-size:9px;
+  pointer-events:none;
+}
+
+@media(max-width:720px){
+  .mobileServerQuickBar{
+    display:flex;
+    flex:0 0 auto;
+    width:100%;
+    gap:6px;
+    padding:6px 8px;
+    overflow-x:auto;
+    overflow-y:hidden;
+    background:#0d0a12;
+    border-bottom:1px solid rgba(255,255,255,.055);
+    scrollbar-width:none;
+  }
+  .mobileServerQuickBar::-webkit-scrollbar{
+    display:none;
+  }
+  .mobileServerQuickBar button{
+    flex:0 0 auto;
+    min-height:34px;
+    padding:7px 10px;
+    border-radius:10px;
+    border:1px solid rgba(255,255,255,.07);
+    background:#17121e;
+    color:#bbaec8;
+    font-size:11px;
+    font-weight:800;
+  }
+
+  .mobileChannelWrap{
+    display:flex;
+    flex:0 0 auto;
+    align-items:center;
+    gap:4px;
+  }
+  .mobileChannelWrap .channelBtn{
+    flex:0 0 auto!important;
+  }
+  .mobileChannelEditBtn{
+    display:inline-flex;
+    align-items:center;
+    justify-content:center;
+    width:30px;
+    height:30px;
+    flex:0 0 30px;
+    border-radius:999px;
+    border:1px solid rgba(168,85,247,.18);
+    background:#181120;
+    color:#b98cf0;
+    font-size:12px;
+  }
+
+  .mobileServerToolGrid{
+    grid-template-columns:1fr 1fr;
+  }
+
+  .ownerMobileTestRow{
+    align-items:flex-start!important;
+    flex-direction:column!important;
+  }
+
+  .ownerMobileTestRow .primary{
+    width:100%;
+  }
+
+  /* Ensure the full desktop-equivalent settings modal is usable on phones. */
+  .modalWrap{
+    align-items:flex-end!important;
+    padding:8px!important;
+  }
+  .modal{
+    width:100%!important;
+    max-width:100%!important;
+    max-height:88dvh!important;
+    overflow-y:auto!important;
+    border-radius:20px!important;
+  }
+  .modal .grid2{
+    grid-template-columns:1fr!important;
+  }
+  .modal .listItem{
+    min-width:0!important;
+  }
+}
+
+/* The preview popup is resized to 414 × 896, and this class makes it
+   visually obvious that the owner is in test mode. */
+body.iphone11PreviewMode{
+  min-width:0!important;
+  width:100%!important;
+  height:100dvh!important;
+  overflow:hidden!important;
+}
+
 </style>
 </head>
 <body>
@@ -2897,7 +3276,8 @@ const state={
  servers:[], activeServer:null, serverInfo:null, serverMembers:[],serverChannels:[],serverRoles:[],
  activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null,
  messagesLoading:false,lastMessageSignature:"",sendingMessage:false,
- typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null
+ messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
+ pendingImage:null
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -2956,6 +3336,7 @@ async function boot(){
    const d=await api("/api/me");
    state.me=d.user;state.profile=d.profile;
    applyTheme(state.profile.theme||"original");
+   applyIPhone11PreviewMode();
    if(d.maintenance){
      renderMaintenance(d.maintenance_message||"VYNTRA is temporarily under maintenance.");
      return;
@@ -3105,6 +3486,54 @@ function presenceDot(p){
  return `<span class="presenceDot ${p?.online?"online":"offline"}"></span>`;
 }
 
+
+const VYNTRA_IPHONE11_PREVIEW=
+ new URLSearchParams(location.search).get("mobile_preview")==="iphone11";
+
+function launchIPhone11Preview(){
+ if(state.profile?.global_role!=="owner"){
+   toast("Owner only");
+   return;
+ }
+
+ const u=new URL(location.href);
+ u.searchParams.set("mobile_preview","iphone11");
+
+ const w=window.open(
+   u.toString(),
+   "vyntra_iphone11_preview",
+   "popup=yes,width=414,height=896,resizable=yes,scrollbars=no"
+ );
+
+ if(!w){
+   toast("Allow popups to open the mobile preview");
+   return;
+ }
+
+ setTimeout(()=>{
+   try{
+     const chromeW=w.outerWidth-w.innerWidth;
+     const chromeH=w.outerHeight-w.innerHeight;
+     w.resizeTo(414+chromeW,896+chromeH);
+     w.focus();
+   }catch(e){}
+ },500);
+}
+
+function applyIPhone11PreviewMode(){
+ if(!VYNTRA_IPHONE11_PREVIEW)return;
+
+ document.body.classList.add("iphone11PreviewMode");
+
+ setTimeout(()=>{
+   try{
+     const chromeW=window.outerWidth-window.innerWidth;
+     const chromeH=window.outerHeight-window.innerHeight;
+     window.resizeTo(414+chromeW,896+chromeH);
+   }catch(e){}
+ },250);
+}
+
 function notificationBellButton(){
  return `<button class="roundBtn notificationBell" onclick="showNotifications()" title="Notifications">🔔<span class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>`;
 }
@@ -3136,16 +3565,25 @@ function renderChat(){
  const title=state.view==="public"?(state.channel==="chat1"?"# Chat 1":"# Chat 2"):"Chat";
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${notificationBellButton()}</div></header>
  <div class="content"><div id="messageList" class="messages"></div></div>
- ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
+ ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
  appShell.classList.remove("with-members");
- loadMessages();
+ loadMessages(true);
  attachTypingListener();
+ renderPhotoPreview();
  state.poll=setInterval(loadMessages,2000);
 }
-function openPublic(c){state.view="public";state.channel=c;state.activeServer=null;state.serverInfo=null;renderApp()}
+function openPublic(c){
+ state.view="public";
+ state.channel=c;
+ state.activeServer=null;
+ state.serverInfo=null;
+ state.lastMessageSignature="";
+ state.messageLoadSeq++;
+ renderApp();
+}
 
 async function loadMessages(force=false){
- if(state.messagesLoading)return;
+ const requestSeq=++state.messageLoadSeq;
 
  const viewAtStart=state.view;
  const channelAtStart=state.channel;
@@ -3154,6 +3592,7 @@ async function loadMessages(force=false){
 
  try{
    state.messagesLoading=true;
+
    let url;
 
    if(viewAtStart==="public"){
@@ -3168,9 +3607,11 @@ async function loadMessages(force=false){
 
    const d=await api(url);
 
-   // Never let an old background request repaint a page
-   // after the user already navigated somewhere else.
+   // Ignore an older response after either:
+   // 1. a newer load started, or
+   // 2. the user navigated to another conversation.
    if(
+     requestSeq!==state.messageLoadSeq ||
      state.view!==viewAtStart ||
      state.channel!==channelAtStart ||
      state.activeServer!==serverAtStart ||
@@ -3187,19 +3628,29 @@ async function loadMessages(force=false){
      m.content,
      (m.reactions||[]).map(r=>`${r.emoji}:${r.count}:${r.mine?1:0}`).join(","),
      m.reply?.id||0,
-     m.is_bot?1:0
+     m.is_bot?1:0,
+     m.image_data?m.image_data.length:0
    ].join("|")).join("~");
 
    state.messages=messages;
    window._lastMessages=messages;
 
-   if(force||sig!==state.lastMessageSignature){
+   const messageList=document.getElementById("messageList");
+
+   // A newly rebuilt chat has an empty DOM even when the message
+   // signature matches the last visit. Always paint that new panel.
+   const needsFreshPaint=!!messageList && messageList.childElementCount===0;
+
+   if(force||needsFreshPaint||sig!==state.lastMessageSignature){
      state.lastMessageSignature=sig;
      drawMessages();
    }
+
  }catch(e){
  }finally{
-   state.messagesLoading=false;
+   if(requestSeq===state.messageLoadSeq){
+     state.messagesLoading=false;
+   }
  }
 }
 function drawMessages(){
@@ -3211,7 +3662,8 @@ function drawMessages(){
    <div class="msgBody"><div class="meta"><span class="name">${esc(m.username)}</span>
    ${m.is_bot?`<span class="roleTag">BOT</span>`:(m.is_spookhook?`<span class="roleTag">VYNTRAHOOK</span>`:(m.role&&m.role!=="user"&&m.role!=="member"?`<span class="roleTag">${esc(m.role)}</span>`:""))}
    <span class="time">${new Date(m.created_at).toLocaleString([], {hour:'2-digit',minute:'2-digit'})}</span>
-   ${m.edited_at?`<span class="edited">(edited)</span>`:""}${m._optimistic?`<span class="edited">sending…</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}<div class="text">${linkifyText(m.content)}</div>${renderLinkEmbed(m)}${renderReactions(m)}</div>
+   ${m.edited_at?`<span class="edited">(edited)</span>`:""}${m._optimistic?`<span class="edited">sending…</span>`:""}</div>${m.reply?`<div class="replyPreview" onclick="scrollToMessage(${m.reply.id})"><div class="replyName">↩ ${esc(m.reply.username)}</div><div class="replyText">${esc(m.reply.content)}</div></div>`:""}${m.content?`<div class="text">${linkifyText(m.content)}</div>`:""}${renderMessagePhoto(m)}${renderLinkEmbed(m)}${renderReactions(m)}</div>
+   ${m._optimistic?"":`<button class="mobileContextBtn messageContextBtn" onclick="messageMenuFromButton(event,${m.id})" aria-label="Message menu">•••</button>`}
  </div>`).join("");
  if(near)el.scrollTop=el.scrollHeight;
 }
@@ -3377,6 +3829,176 @@ function renderTypingIndicator(){
  `;
 }
 
+
+function photoComposerControls(){
+ return `<button class="photoSendBtn" type="button" onclick="choosePhoto()" title="Send photo">📷</button>
+ <input id="photoInput" type="file" accept="image/jpeg,image/png,image/webp,image/gif" hidden onchange="handlePhotoSelected(this)">`;
+}
+
+function choosePhoto(){
+ const input=document.getElementById("photoInput");
+ if(input)input.click();
+}
+
+async function compressPhoto(file){
+ if(!file)return null;
+
+ if(file.type==="image/gif"){
+   if(file.size>1400000){
+     throw new Error("GIF is too large. Maximum is about 1.4 MB.");
+   }
+   return await fileToDataURL(file);
+ }
+
+ const raw=await fileToDataURL(file);
+ const img=await new Promise((resolve,reject)=>{
+   const i=new Image();
+   i.onload=()=>resolve(i);
+   i.onerror=()=>reject(new Error("Could not read that image."));
+   i.src=raw;
+ });
+
+ const maxSide=1400;
+ let w=img.width;
+ let h=img.height;
+
+ if(Math.max(w,h)>maxSide){
+   const scale=maxSide/Math.max(w,h);
+   w=Math.round(w*scale);
+   h=Math.round(h*scale);
+ }
+
+ const canvas=document.createElement("canvas");
+ canvas.width=w;
+ canvas.height=h;
+
+ const ctx=canvas.getContext("2d");
+ ctx.drawImage(img,0,0,w,h);
+
+ let quality=.84;
+ let result=canvas.toDataURL("image/jpeg",quality);
+
+ while(result.length>1900000 && quality>.48){
+   quality-=.08;
+   result=canvas.toDataURL("image/jpeg",quality);
+ }
+
+ if(result.length>2200000){
+   throw new Error("Photo is still too large after compression.");
+ }
+
+ return result;
+}
+
+function fileToDataURL(file){
+ return new Promise((resolve,reject)=>{
+   const reader=new FileReader();
+   reader.onload=()=>resolve(reader.result);
+   reader.onerror=()=>reject(new Error("Could not read that file."));
+   reader.readAsDataURL(file);
+ });
+}
+
+async function handlePhotoSelected(input){
+ const file=input?.files?.[0];
+ if(!file)return;
+
+ try{
+   state.pendingImage=await compressPhoto(file);
+   renderPhotoPreview();
+   toast("Photo ready to send");
+ }catch(e){
+   state.pendingImage=null;
+   toast(e.message);
+ }
+
+ input.value="";
+}
+
+function clearPendingPhoto(){
+ state.pendingImage=null;
+ renderPhotoPreview();
+}
+
+function renderPhotoPreview(){
+ let preview=document.getElementById("pendingPhotoPreview");
+
+ if(!state.pendingImage){
+   if(preview)preview.remove();
+   return;
+ }
+
+ const composer=document.querySelector(".composer");
+ if(!composer)return;
+
+ if(!preview){
+   preview=document.createElement("div");
+   preview.id="pendingPhotoPreview";
+   preview.className="pendingPhotoPreview";
+   composer.parentNode.insertBefore(preview,composer);
+ }
+
+ preview.innerHTML=`
+   <img src="${state.pendingImage}" alt="Photo ready to send">
+   <div class="listMain">
+     <div class="listTitle">Photo ready</div>
+     <div class="listSub">It will be sent with your message.</div>
+   </div>
+   <button class="roundBtn" type="button" onclick="clearPendingPhoto()">×</button>
+ `;
+}
+
+function renderMessagePhoto(m){
+ if(!m.image_data)return "";
+ return `<button class="messagePhotoButton" onclick="openMessagePhoto(${m.id})">
+   <img class="messagePhoto" src="${m.image_data}" alt="Photo from ${esc(m.username)}">
+ </button>`;
+}
+
+function openMessagePhoto(mid){
+ const m=(state.messages||[]).find(x=>Number(x.id)===Number(mid));
+ if(!m?.image_data)return;
+
+ modalOpen("Photo",`
+   <div class="photoViewer">
+     <img src="${m.image_data}" alt="Message photo">
+   </div>
+ `);
+}
+
+function messageMenuFromButton(ev,mid){
+ ev.preventDefault();
+ ev.stopPropagation();
+
+ const r=ev.currentTarget.getBoundingClientRect();
+ messageMenu({
+   preventDefault(){},
+   stopPropagation(){},
+   clientX:Math.max(8,r.right-210),
+   clientY:Math.min(innerHeight-20,r.bottom+4)
+ },mid);
+}
+
+function memberMenuFromButton(ev,id,isBot){
+ ev.preventDefault();
+ ev.stopPropagation();
+
+ const r=ev.currentTarget.getBoundingClientRect();
+ const fake={
+   preventDefault(){},
+   stopPropagation(){},
+   clientX:Math.max(8,r.right-220),
+   clientY:Math.min(innerHeight-20,r.bottom+4)
+ };
+
+ if(isBot){
+   serverBotMemberMenu(fake,id);
+ }else{
+   serverMemberMenu(fake,id);
+ }
+}
+
+
 async function sendMessage(){
  if(state.sendingMessage)return;
 
@@ -3384,9 +4006,15 @@ async function sendMessage(){
  if(!inp)return;
 
  const content=inp.value.trim();
- if(!content)return;
+ const pendingImage=state.pendingImage;
 
- const b={content,reply_to_id:state.replyingTo?.id||null};
+ if(!content&&!pendingImage)return;
+
+ const b={
+   content,
+   image_data:pendingImage||"",
+   reply_to_id:state.replyingTo?.id||null
+ };
 
  if(state.view==="public"){
    b.kind="public";b.channel=state.channel;
@@ -3399,14 +4027,18 @@ async function sendMessage(){
  // Clear immediately so the interface feels instant.
  inp.value="";
  const originalReply=state.replyingTo;
+ const originalImage=pendingImage;
  state.replyingTo=null;
+ state.pendingImage=null;
  renderReplyBar();
+ renderPhotoPreview();
 
  const tempId=-Date.now();
  const optimistic={
    id:tempId,
    user_id:state.profile.id,
    content,
+   image_data:originalImage||"",
    created_at:new Date().toISOString(),
    edited_at:null,
    username:state.profile.username,
@@ -3445,7 +4077,9 @@ async function sendMessage(){
    drawMessages();
    inp.value=content;
    state.replyingTo=originalReply;
+   state.pendingImage=originalImage;
    renderReplyBar();
+   renderPhotoPreview();
    toast(e.message);
  }finally{
    state.sendingMessage=false;
@@ -3778,16 +4412,40 @@ async function searchUsers(){
  }catch(e){toast(e.message)}
 }
 async function addFriend(uid){try{await api("/api/friends",{method:"POST",body:JSON.stringify({user_id:uid})});toast("Friend added");if(state.view==="friends"){renderFriendsPage()}}catch(e){toast(e.message)}}
-async function startDM(uid){try{const d=await api("/api/dms",{method:"POST",body:JSON.stringify({user_id:uid})});state.view="dm";state.activeChat=d.chat_id;state.activeServer=null;renderDM(d.chat_id)}catch(e){toast(e.message)}}
+async function startDM(uid){
+ try{
+   const d=await api("/api/dms",{
+     method:"POST",
+     body:JSON.stringify({user_id:uid})
+   });
+
+   state.view="dm";
+   state.activeChat=d.chat_id;
+   state.activeServer=null;
+   state.lastMessageSignature="";
+   state.messageLoadSeq++;
+
+   await renderDM(d.chat_id);
+ }catch(e){
+   toast(e.message);
+ }
+}
 function drawChats(list){chatList.innerHTML=list.length?list.map(c=>`<button class="sideBtn" onclick="openChat(${c.id})"><span class="iconBox">${c.kind==="group"?"👥":"💬"}</span>${esc(c.display_name)}</button>`).join(""):`<div class="muted">No DMs or groups yet.</div>`}
-async function openChat(id){state.view="dm";state.activeChat=id;state.activeServer=null;renderDM(id)}
+async function openChat(id){
+ state.view="dm";
+ state.activeChat=id;
+ state.activeServer=null;
+ state.lastMessageSignature="";
+ state.messageLoadSeq++;
+ await renderDM(id);
+}
 async function renderDM(id){
  clearInterval(state.poll);
  root.innerHTML=`<div id="appShell" class="app">${sidebar()}<main class="main"><div id="mainArea" style="height:100%;display:flex;flex-direction:column"></div></main><aside id="membersPane" class="membersPane"></aside></div>${mobilebar()}`;
  let info=await api("/api/chats/"+id);
  await markChatNotificationsRead(id);
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
- loadMessages();attachTypingListener();state.poll=setInterval(loadMessages,2000);
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
+ loadMessages(true);attachTypingListener();renderPhotoPreview();state.poll=setInterval(loadMessages,2000);
 }
 function groupCreate(){modalOpen("Create group chat",`<form class="formGrid" onsubmit="makeGroup(event)"><div class="label">Group name</div><input id="groupName" class="field" maxlength="50" required><div class="label">Add usernames</div><input id="groupUsers" class="field" placeholder="alex, sam, jordan"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create</button></div></form>`)}
 async function makeGroup(e){e.preventDefault();try{const d=await api("/api/groups",{method:"POST",body:JSON.stringify({name:groupName.value,usernames:groupUsers.value.split(",").map(x=>x.trim()).filter(Boolean)})});modalClose();openChat(d.chat_id)}catch(e){toast(e.message)}}
@@ -3843,6 +4501,8 @@ async function openServer(id,ch=null){
  // Change navigation immediately, but don't render an empty/wrong server.
  state.view="server";
  state.activeServer=wantedServer;
+ state.lastMessageSignature="";
+ state.messageLoadSeq++;
 
  try{
    const d=await api(`/api/servers/${wantedServer}/bootstrap`);
@@ -3884,17 +4544,144 @@ async function openServer(id,ch=null){
  }
 }
 
+
+function openMobileRoleManager(){
+ if(state.view!=="server"||!state.activeServer)return;
+
+ const sid=state.activeServer;
+
+ modalOpen("Server Roles",`
+   <div class="row between" style="margin-bottom:12px">
+     <div>
+       <div class="listTitle">Roles</div>
+       <div class="listSub">Create roles, edit permissions, or remove roles.</div>
+     </div>
+     ${hasServerPerm("manage_roles")?`<button class="primary" onclick="modalClose();createCustomRole(${sid})">＋ Role</button>`:""}
+   </div>
+
+   <div class="formGrid">
+     ${(state.serverRoles||[]).length
+       ?state.serverRoles.map(r=>`
+         <div class="listItem">
+           <div class="listMain">
+             <div class="listTitle">${esc(r.name)}</div>
+             <div class="listSub">${Object.entries(r.permissions||{}).filter(([k,v])=>v).length} enabled permissions</div>
+           </div>
+           ${hasServerPerm("manage_roles")?`
+             <button class="ghost" onclick="modalClose();editCustomRole(${sid},${r.id})">Edit</button>
+             <button class="danger" onclick="deleteCustomRole(${sid},${r.id})">Delete</button>
+           `:""}
+         </div>`).join("")
+       :`<div class="muted">No custom roles yet.</div>`
+     }
+   </div>
+ `);
+}
+
+function openMobileCurrentChannelSettings(){
+ if(state.view!=="server"||!state.channel)return;
+
+ if(!hasServerPerm("manage_channels")){
+   toast("Manage Channels permission required");
+   return;
+ }
+
+ channelSettings(Number(state.channel));
+}
+
+function openMobileServerTools(){
+ if(state.view!=="server"||!state.activeServer)return;
+
+ const s=state.serverInfo;
+ const canChannels=hasServerPerm("manage_channels");
+ const canRoles=hasServerPerm("manage_roles");
+ const canServer=hasServerPerm("manage_server")||s?.my_role==="owner";
+ const canInvite=hasServerPerm("invite_members");
+ const canBan=hasServerPerm("ban_members");
+
+ modalOpen("Server Tools",`
+   <div class="mobileServerToolGrid">
+     <button class="mobileServerTool" onclick="modalClose();showMobileMembers()">
+       <b>Members</b>
+       <span>Members, bots, roles, moderation</span>
+     </button>
+
+     ${canChannels?`
+       <button class="mobileServerTool" onclick="modalClose();createChannelPrompt()">
+         <b>Create Channel</b>
+         <span>Add chat or announcement channels</span>
+       </button>
+
+       <button class="mobileServerTool" onclick="modalClose();openMobileCurrentChannelSettings()">
+         <b>Edit Channel</b>
+         <span>Name and channel role permissions</span>
+       </button>
+     `:""}
+
+     ${canRoles?`
+       <button class="mobileServerTool" onclick="modalClose();openMobileRoleManager()">
+         <b>Roles</b>
+         <span>Create roles and edit permissions</span>
+       </button>
+     `:""}
+
+     ${canInvite?`
+       <button class="mobileServerTool" onclick="modalClose();showServerInvite(${s.id})">
+         <b>Invites</b>
+         <span>Create and copy server invite links</span>
+       </button>
+     `:""}
+
+     ${canBan?`
+       <button class="mobileServerTool" onclick="modalClose();showServerSettings(${s.id})">
+         <b>Bans & Requests</b>
+         <span>Unban users and review join requests</span>
+       </button>
+     `:""}
+
+     ${canServer?`
+       <button class="mobileServerTool mobileServerToolWide" onclick="modalClose();showServerSettings(${s.id})">
+         <b>Server Settings</b>
+         <span>Name, picture, privacy, roles, bots, members, bans and join requests</span>
+       </button>
+     `:""}
+   </div>
+ `);
+}
+
 function showMobileServerActions(){
- const s=state.serverInfo;if(!s)return;
- modalOpen(s.name,`<div class="formGrid">
-   <button class="ghost" onclick="modalClose();showNotifications()">🔔 Notifications</button>
-   ${hasServerPerm("invite_members")?`<button class="ghost" onclick="modalClose();showServerInvite(${s.id})">🔗 Invite People</button>`:""}
-   ${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="modalClose();showServerSettings(${s.id})">⚙ Server Settings</button>`:""}
-   <button class="ghost" onclick="modalClose();showMobileMembers()">👥 Members · ${s.member_count}</button>
- </div>`);
+ const s=state.serverInfo;
+ if(!s)return;
+
+ modalOpen(s.name,`
+   <div class="formGrid">
+     <button class="primary" onclick="modalClose();openMobileServerTools()">⚙ Server Tools</button>
+
+     ${hasServerPerm("manage_channels")?`
+       <button class="ghost" onclick="modalClose();createChannelPrompt()">＋ Create Channel</button>
+       <button class="ghost" onclick="modalClose();openMobileCurrentChannelSettings()">✎ Edit Current Channel</button>
+     `:""}
+
+     ${hasServerPerm("manage_roles")?`
+       <button class="ghost" onclick="modalClose();openMobileRoleManager()">🏷 Roles & Permissions</button>
+     `:""}
+
+     ${hasServerPerm("invite_members")?`
+       <button class="ghost" onclick="modalClose();showServerInvite(${s.id})">🔗 Invite People</button>
+     `:""}
+
+     ${hasServerPerm("manage_server")||s.my_role==="owner"?`
+       <button class="ghost" onclick="modalClose();showServerSettings(${s.id})">⚙ Full Server Settings</button>
+     `:""}
+
+     <button class="ghost" onclick="modalClose();showMobileMembers()">👥 Members · ${s.member_count}</button>
+     <button class="ghost" onclick="modalClose();showNotifications()">🔔 Notifications</button>
+   </div>
+ `);
 }
 function showMobileMembers(){
- const rows=(state.serverMembers||[]).map(m=>`<div class="listItem memberRow mobileHoldTarget" data-member-id="${m.is_bot?m.bot_id:m.id}" data-is-bot="${m.is_bot?1:0}"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)} ${m.is_bot?`<span class="roleTag">BOT</span>`:""}</div><div class="listSub">${m.is_bot?(m.role==="admin"?"Administrator Bot":"Bot"):`${m.online?"Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)}${(m.custom_roles||[]).length?` · ${(m.custom_roles||[]).map(r=>esc(r.name)).join(", ")}`:""} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}`}</div></div>${m.is_bot?`<button class="ghost" onclick="viewBotServerInfo(${m.bot_id})">Bot</button>`:`<button class="ghost" onclick="viewProfile(${m.id})">Profile</button>`}</div>`).join("");
+ const rows=(state.serverMembers||[]).map(m=>`<div class="listItem memberRow mobileHoldTarget" data-member-id="${m.is_bot?m.bot_id:m.id}" data-is-bot="${m.is_bot?1:0}"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)} ${m.is_bot?`<span class="roleTag">BOT</span>`:""}</div><div class="listSub">${m.is_bot?(m.role==="admin"?"Administrator Bot":"Bot"):`${m.online?"Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)}${(m.custom_roles||[]).length?` · ${(m.custom_roles||[]).map(r=>esc(r.name)).join(", ")}`:""} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}`}</div></div><button class="mobileContextBtn memberContextBtn mobileSheetMenu"
+ onclick="memberMenuFromButton(event,${m.is_bot?m.bot_id:m.id},${m.is_bot?"true":"false"})">•••</button></div>`).join("");
  modalOpen(`Members · ${state.serverMembers.length}`,rows||`<div class="muted">No members.</div>`);
  setTimeout(attachMobileHoldMenus,30);
 }
@@ -3904,21 +4691,29 @@ function renderServer(){
  const s=state.serverInfo; if(!s){openPublic("chat1");return}
  if(window.innerWidth>1000)appShell.classList.add("with-members");else appShell.classList.remove("with-members");
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions serverDesktopActions">${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div><button class="roundBtn serverMobileMenu" onclick="showMobileServerActions()">•••</button></header>
+ <div class="mobileServerQuickBar">
+   <button onclick="showMobileMembers()">Members</button>
+   ${hasServerPerm("manage_channels")?`<button onclick="createChannelPrompt()">＋ Channel</button>`:""}
+   ${hasServerPerm("manage_channels")?`<button onclick="openMobileCurrentChannelSettings()">Edit Channel</button>`:""}
+   ${hasServerPerm("manage_roles")?`<button onclick="openMobileRoleManager()">Roles</button>`:""}
+   ${hasServerPerm("manage_server")||s.my_role==="owner"?`<button onclick="showServerSettings(${s.id})">Settings</button>`:""}
+ </div>
  <div class="serverWorkspace">
    <div class="serverChannelRail">
      <div class="sectionTitle serverChannelTitle"><span>Channels</span>${hasServerPerm("manage_channels")?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
      <div class="serverChannelButtons">
-       ${state.serverChannels.map(c=>`<button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</button>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
+       ${state.serverChannels.map(c=>`<div class="mobileChannelWrap"><button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</button>${hasServerPerm("manage_channels")?`<button class="mobileChannelEditBtn" onclick="event.stopPropagation();channelSettings(${c.id})" title="Edit channel">⚙</button>`:""}</div>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
      </div>
    </div>
    <div class="serverConversation">
      <div class="content"><div id="messageList" class="messages"></div></div>
-     <div class="composer"><input id="messageInput" maxlength="4000" placeholder="Message channel..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>
+     <div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message channel..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>
    </div>
  </div>`;
  renderMembers();
- loadMessages();
+ loadMessages(true);
  attachTypingListener();
+ renderPhotoPreview();
  state.poll=setInterval(loadMessages,2200);
  state.memberPoll=setInterval(refreshActiveServerMembers,15000);
 }
@@ -3961,6 +4756,9 @@ function renderMembers(){
          }
        </div>
      </div>
+     <button class="mobileContextBtn memberContextBtn"
+       onclick="memberMenuFromButton(event,${m.is_bot?m.bot_id:m.id},${m.is_bot?"true":"false"})"
+       aria-label="Member menu">•••</button>
    </div>`).join("")}</div>`;
 
  attachMobileHoldMenus();
@@ -4460,6 +5258,17 @@ async function renderOwnerPanel(){
  mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">Owner Control Center</div><div class="topSub">Whole-site administration</div></div><div class="topActions">${notificationBellButton()}</div></header>
  <div class="page"><div class="pageHero"><div><h1>Owner Control Center</h1><div class="muted">Manage VYNTRA as a platform.</div></div></div>
  <div id="ownerStats" class="grid2"></div>
+
+ <div class="card ownerMobileTestCard">
+   <div class="row between ownerMobileTestRow">
+     <div>
+       <h3 style="margin:0">Mobile UI Testing</h3>
+       <div class="muted" style="margin-top:5px">Open VYNTRA in a separate iPhone 11-sized test window. The preview uses a 414 × 896 CSS-pixel viewport and the real mobile navigation/server controls.</div>
+     </div>
+     <button class="primary" onclick="launchIPhone11Preview()">Open iPhone 11 Preview</button>
+   </div>
+ </div>
+
  <div class="grid2">
    <div class="card"><h3>Site Controls</h3><div id="ownerSiteControls">Loading...</div></div>
    <div class="card"><h3>Global Announcement</h3><div class="muted" style="margin-bottom:10px">Shown to everyone in the app.</div><textarea id="ownerAnnouncement" class="field" rows="5" maxlength="500"></textarea><button class="primary" style="margin-top:10px" onclick="saveOwnerSettings()">Save Announcement</button></div>
@@ -6564,16 +7373,33 @@ def server_join(sid):
 @login_required
 def servers_list():
     with connect() as c:
-        rows = c.execute("""
-            select s.id,s.name,s.icon,sm.role,
-                   (select count(*) from server_members x where x.server_id=s.id and
-                    (x.banned_until is null or x.banned_until<=now())) as member_count
-            from servers s join server_members sm on sm.server_id=s.id
-            where sm.user_id=%s and (sm.banned_until is null or sm.banned_until<=now())
-            order by s.created_at
-        """, (request.me["id"],)).fetchall()
+        if request.me["global_role"]=="owner":
+            rows=c.execute("""
+                select s.id,s.name,s.icon,'owner' as role,
+                       (select count(*) from server_members x where x.server_id=s.id) as member_count
+                from servers s
+                order by s.created_at
+            """).fetchall()
+        else:
+            rows=c.execute("""
+                select s.id,s.name,s.icon,sm.role,
+                       (select count(*) from server_members x where x.server_id=s.id) as member_count
+                from servers s
+                join server_members sm on sm.server_id=s.id
+                where sm.user_id=%s
+                order by s.created_at
+            """,(request.me["id"],)).fetchall()
+
     return jsonify(servers=[
-        {"id":r[0],"name":r[1],"icon":r[2],"role":r[3],"member_count":r[4]} for r in rows
+        {
+            "id":r[0],
+            "name":r[1],
+            "icon":r[2],
+            "role":r[3],
+            "member_count":r[4],
+            "global_owner_access":request.me["global_role"]=="owner"
+        }
+        for r in rows
     ])
 
 @app.post("/api/servers")
@@ -6608,14 +7434,17 @@ def server_bootstrap(sid):
     now=datetime.now(timezone.utc)
 
     with connect() as c:
-        member=c.execute("""
-            select role,banned_until,muted_until,joined_at
-            from server_members
-            where server_id=%s and user_id=%s
-        """,(sid,request.me["id"])).fetchone()
+        if request.me["global_role"]=="owner":
+            member=("owner",None,None,None)
+        else:
+            member=c.execute("""
+                select role,banned_until,muted_until,joined_at
+                from server_members
+                where server_id=%s and user_id=%s
+            """,(sid,request.me["id"])).fetchone()
 
-        if not member:
-            return jsonify(error="Not a server member"),403
+            if not member:
+                return jsonify(error="Not a server member"),403
 
         server=c.execute("""
             select s.id,s.name,s.icon,s.owner_id,s.privacy_mode,
@@ -7712,7 +8541,7 @@ def messages_get():
               select m.id,m.user_id,m.content,m.created_at,m.edited_at,
                      u.username,u.avatar,
                      case when u.show_staff_tag then u.global_role else 'user' end,
-                     m.is_spookhook,m.reply_to_id
+                     m.is_spookhook,m.reply_to_id,m.image_data
               from messages m
               join users u on u.id=m.user_id
               where m.kind='public' and m.channel=%s
@@ -7746,7 +8575,7 @@ def messages_get():
                      end,
                      case when m.bot_id is not null then b.avatar else u.avatar end,
                      case when m.bot_id is not null then 'bot' else coalesce(author_sm.role,'member') end,
-                     m.is_spookhook,m.reply_to_id,m.bot_id
+                     m.is_spookhook,m.reply_to_id,m.bot_id,m.image_data
               from messages m
               join users u on u.id=m.user_id
               left join vyntra_bots b on b.id=m.bot_id
@@ -7777,7 +8606,7 @@ def messages_get():
               select m.id,m.user_id,m.content,m.created_at,m.edited_at,
                      u.username,u.avatar,
                      case when u.show_staff_tag then u.global_role else 'user' end,
-                     m.is_spookhook,m.reply_to_id
+                     m.is_spookhook,m.reply_to_id,m.image_data
               from messages m
               join users u on u.id=m.user_id
               where m.kind='dm' and m.chat_id=%s
@@ -7863,7 +8692,11 @@ def messages_get():
             "reactions":reaction_map.get(r[0],[]),
             "embed_url":extract_first_url(r[2]),
             "embed_allowed":True,
-            "reply":reply_map.get(r[9]) if r[9] else None
+            "reply":reply_map.get(r[9]) if r[9] else None,
+            "image_data":(
+                r[11] if kind=="server" and len(r)>11
+                else (r[10] if kind!="server" and len(r)>10 else "")
+            )
         }
 
         if kind=="server":
@@ -7972,9 +8805,20 @@ def typing_get():
 @login_required
 def messages_post():
     d=request.get_json(silent=True) or {}
-    content=str(d.get("content","")).strip();kind=d.get("kind")
-    if not content or len(content)>4000 or kind not in ("public","server","dm"):
-        return jsonify(error="Invalid message"),400
+    content=str(d.get("content","")).strip()
+    kind=d.get("kind")
+
+    try:
+        image_data=validate_message_image(d.get("image_data",""))
+    except ValueError as e:
+        return jsonify(error=str(e)),400
+
+    if (
+        (not content and not image_data)
+        or len(content)>4000
+        or kind not in ("public","server","dm")
+    ):
+        return jsonify(error="Message text or photo required"),400
 
     if kind=="public":
         public_settings=get_site_settings()
@@ -8031,9 +8875,14 @@ def messages_post():
                 return jsonify(error="Reply target is not in this chat."),400
 
         mid=c.execute("""
-          insert into messages(user_id,content,kind,channel,server_id,chat_id,reply_to_id)
-          values(%s,%s,%s,%s,%s,%s,%s) returning id
-        """,(request.me["id"],content,kind,channel,sid,cid,reply_to_id)).fetchone()[0]
+          insert into messages(
+              user_id,content,kind,channel,server_id,chat_id,reply_to_id,image_data
+          )
+          values(%s,%s,%s,%s,%s,%s,%s,%s)
+          returning id
+        """,(
+            request.me["id"],content,kind,channel,sid,cid,reply_to_id,image_data
+        )).fetchone()[0]
 
         if kind=="dm" and cid:
             chat=c.execute("select kind,name from chats where id=%s",(cid,)).fetchone()
@@ -8043,7 +8892,7 @@ def messages_post():
             """,(cid,request.me["id"])).fetchall()
             notification_type="group_message" if chat and chat[0]=="group" else "dm_message"
             title=(chat[1]+" · "+request.me["username"]) if chat and chat[0]=="group" and chat[1] else request.me["username"]
-            preview=content[:180]
+            preview=content[:180] if content else "Sent a photo"
             for recipient in recipients:
                 c.execute("""
                     insert into notifications(user_id,actor_id,type,title,body,chat_id)
