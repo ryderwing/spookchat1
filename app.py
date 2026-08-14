@@ -263,6 +263,18 @@ create table if not exists messages(
 
 
 
+
+create table if not exists message_read_state(
+ user_id bigint not null references users(id) on delete cascade,
+ scope_key text not null,
+ last_message_id bigint not null default 0,
+ updated_at timestamptz not null default now(),
+ primary key(user_id,scope_key)
+);
+
+create index if not exists message_read_state_user_idx
+on message_read_state(user_id,updated_at);
+
 create table if not exists typing_status(
  user_id bigint not null references users(id) on delete cascade,
  scope_key text not null,
@@ -530,6 +542,18 @@ def init_db():
             """)
             c.execute("create index if not exists server_bans_server_idx on server_bans(server_id,banned_until)")
 
+
+            c.execute("""
+                create table if not exists message_read_state(
+                 user_id bigint not null references users(id) on delete cascade,
+                 scope_key text not null,
+                 last_message_id bigint not null default 0,
+                 updated_at timestamptz not null default now(),
+                 primary key(user_id,scope_key)
+                )
+            """)
+            c.execute("create index if not exists message_read_state_user_idx on message_read_state(user_id,updated_at)")
+
             c.execute("insert into site_settings(id) values(1) on conflict(id) do nothing")
 
             c.execute("alter table site_settings add column if not exists public_channels_locked boolean not null default false")
@@ -606,6 +630,16 @@ def presence_payload(last_seen):
         "online":(now-last_seen).total_seconds() <= ONLINE_SECONDS,
         "last_seen":last_seen.isoformat()
     }
+
+
+def message_scope_key(kind,channel=None,server_id=None,chat_id=None):
+    if kind=="public":
+        return f"public:{str(channel)}"
+    if kind=="server":
+        return f"server:{int(server_id)}:{str(channel)}"
+    if kind=="dm":
+        return f"dm:{int(chat_id)}"
+    return ""
 
 def typing_scope_key(kind,channel=None,server_id=None,chat_id=None):
     if kind=="public":
@@ -3262,6 +3296,64 @@ body.iphone11PreviewMode{
   overflow:hidden!important;
 }
 
+
+/* ============================================================
+   VYNTRA UNREAD BADGES
+   ============================================================ */
+.unreadBadge{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  min-width:18px;
+  height:18px;
+  padding:0 5px;
+  margin-left:auto;
+  border-radius:999px;
+  background:#a855f7;
+  color:white;
+  font-size:10px;
+  font-weight:900;
+  line-height:1;
+  box-shadow:0 0 12px rgba(168,85,247,.28);
+}
+.sideBtn .unreadBadge{
+  margin-left:auto;
+}
+.channelBtn .unreadBadge{
+  margin-left:6px;
+}
+.serverBtn{
+  position:relative;
+}
+.serverBtn .serverUnreadBadge,
+.serverBtn .unreadBadge{
+  position:absolute;
+  right:-3px;
+  top:-4px;
+  min-width:17px;
+  height:17px;
+  padding:0 4px;
+  font-size:9px;
+  border:2px solid #0d0912;
+}
+.listTitle .unreadBadge{
+  margin-left:6px;
+  vertical-align:middle;
+}
+@media(max-width:720px){
+  .mobilebar button{
+    position:relative;
+  }
+  .mobilebar .unreadBadge{
+    position:absolute;
+    right:6px;
+    top:3px;
+    min-width:16px;
+    height:16px;
+    font-size:9px;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -3277,7 +3369,8 @@ const state={
  activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null,
  messagesLoading:false,lastMessageSignature:"",sendingMessage:false,
  messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
- pendingImage:null
+ pendingImage:null,unreads:{public:{},dms:{},servers:{},server_totals:{},friends_total:0,total:0},
+ unreadPoll:null,notificationPermission:"default",lastNotified:{}
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -3336,6 +3429,7 @@ async function boot(){
    const d=await api("/api/me");
    state.me=d.user;state.profile=d.profile;
    applyTheme(state.profile.theme||"original");
+ setTimeout(updateNotificationSettingUI,40);
    applyIPhone11PreviewMode();
    if(d.maintenance){
      renderMaintenance(d.maintenance_message||"VYNTRA is temporarily under maintenance.");
@@ -3346,6 +3440,7 @@ async function boot(){
    startNotificationPolling();
    setTimeout(checkInviteFromURL,150);
    setTimeout(checkBotInviteFromURL,220);
+   setTimeout(startUnreadPolling,300);
  }catch(e){renderLogin()}
 }
 
@@ -3534,6 +3629,256 @@ function applyIPhone11PreviewMode(){
  },250);
 }
 
+
+function badgeHtml(count,extraClass=""){
+ count=Number(count||0);
+ if(count<=0)return "";
+ return `<span class="unreadBadge ${extraClass}">${count>99?"99+":count}</span>`;
+}
+
+function currentReadPayload(){
+ if(state.view==="public"){
+   return {kind:"public",channel:state.channel};
+ }
+ if(state.view==="server"){
+   return {
+     kind:"server",
+     channel:state.channel,
+     server_id:state.activeServer
+   };
+ }
+ if(state.view==="dm"){
+   return {
+     kind:"dm",
+     chat_id:state.activeChat
+   };
+ }
+ return null;
+}
+
+async function markCurrentConversationRead(){
+ const payload=currentReadPayload();
+ if(!payload)return;
+
+ try{
+   await api("/api/read-state",{
+     method:"POST",
+     body:JSON.stringify(payload)
+   });
+
+   if(payload.kind==="public"){
+     delete state.unreads.public?.[String(payload.channel)];
+   }else if(payload.kind==="dm"){
+     delete state.unreads.dms?.[String(payload.chat_id)];
+   }else if(payload.kind==="server"){
+     const sid=String(payload.server_id);
+     const cid=String(payload.channel);
+
+     if(state.unreads.servers?.[sid]){
+       delete state.unreads.servers[sid][cid];
+     }
+   }
+
+   await loadUnreadCounts(false);
+
+ }catch(e){}
+}
+
+function unreadNotificationKey(type,a,b=null){
+ return b===null?`${type}:${a}`:`${type}:${a}:${b}`;
+}
+
+function maybeShowSystemNotifications(previous,next){
+ if(document.visibilityState==="visible"&&document.hasFocus())return;
+ if(Notification.permission!=="granted")return;
+
+ // Public channels
+ for(const [channel,data] of Object.entries(next.public||{})){
+   const old=Number(previous.public?.[channel]?.last_message_id||0);
+   const now=Number(data.last_message_id||0);
+
+   if(now>old){
+     showSystemNotification(
+       `New message in ${channel}`,
+       `${data.count} unread message${data.count===1?"":"s"}`,
+       {kind:"public",channel}
+     );
+   }
+ }
+
+ // DMs and group chats
+ for(const [chatId,data] of Object.entries(next.dms||{})){
+   const old=Number(previous.dms?.[chatId]?.last_message_id||0);
+   const now=Number(data.last_message_id||0);
+
+   if(now>old){
+     showSystemNotification(
+       "New VYNTRA message",
+       `${data.count} unread message${data.count===1?"":"s"} in Friends`,
+       {kind:"dm",chat_id:Number(chatId)}
+     );
+   }
+ }
+
+ // Server channels
+ for(const [sid,channels] of Object.entries(next.servers||{})){
+   for(const [cid,data] of Object.entries(channels||{})){
+     const old=Number(previous.servers?.[sid]?.[cid]?.last_message_id||0);
+     const now=Number(data.last_message_id||0);
+
+     if(now>old){
+       const server=(state.servers||[]).find(s=>String(s.id)===String(sid));
+       const ch=(
+         state.activeServer&&String(state.activeServer)===String(sid)
+           ?state.serverChannels
+           :[]
+       )?.find(c=>String(c.id)===String(cid));
+
+       showSystemNotification(
+         server?`New message in ${server.name}`:"New server message",
+         ch?`#${ch.name}`:"A server channel has a new message",
+         {kind:"server",server_id:Number(sid),channel:Number(cid)}
+       );
+     }
+   }
+ }
+}
+
+async function loadUnreadCounts(notify=true){
+ try{
+   const previous=state.unreads||{
+     public:{},dms:{},servers:{},server_totals:{},
+     friends_total:0,total:0
+   };
+
+   const next=await api("/api/unreads");
+   state.unreads=next;
+
+   if(notify){
+     maybeShowSystemNotifications(previous,next);
+   }
+
+   updateUnreadBadges();
+
+ }catch(e){}
+}
+
+function startUnreadPolling(){
+ clearInterval(state.unreadPoll);
+ loadUnreadCounts(false);
+ state.unreadPoll=setInterval(
+   ()=>loadUnreadCounts(true),
+   2500
+ );
+}
+
+function updateUnreadBadges(){
+ document.querySelectorAll("[data-unread-scope]").forEach(el=>{
+   const type=el.dataset.unreadScope;
+   let count=0;
+
+   if(type==="public"){
+     count=state.unreads.public?.[el.dataset.channel]?.count||0;
+   }else if(type==="friends"){
+     count=state.unreads.friends_total||0;
+   }else if(type==="server"){
+     count=state.unreads.server_totals?.[el.dataset.serverId]||0;
+   }else if(type==="server-channel"){
+     count=state.unreads.servers?.[el.dataset.serverId]?.[el.dataset.channel]?.count||0;
+   }else if(type==="dm"){
+     count=state.unreads.dms?.[el.dataset.chatId]?.count||0;
+   }
+
+   let badge=el.querySelector(".unreadBadge");
+
+   if(count>0){
+     if(!badge){
+       badge=document.createElement("span");
+       badge.className="unreadBadge";
+       el.appendChild(badge);
+     }
+     badge.textContent=count>99?"99+":String(count);
+   }else if(badge){
+     badge.remove();
+   }
+ });
+
+ // Browser/app title
+ document.title=state.unreads.total>0
+   ?`(${state.unreads.total}) VYNTRA`
+   :"VYNTRA";
+}
+
+async function requestSystemNotifications(){
+ if(!("Notification" in window)){
+   toast("Notifications are not supported by this browser.");
+   return;
+ }
+
+ try{
+   const result=await Notification.requestPermission();
+   state.notificationPermission=result;
+
+   toast(
+     result==="granted"
+       ?"System notifications enabled"
+       :result==="denied"
+         ?"Notifications were blocked"
+         :"Notification permission was not granted"
+   );
+
+   updateNotificationSettingUI();
+
+ }catch(e){
+   toast("Could not enable notifications");
+ }
+}
+
+function updateNotificationSettingUI(){
+ const el=document.getElementById("notificationPermissionState");
+ if(!el)return;
+
+ if(!("Notification" in window)){
+   el.textContent="Not supported";
+   return;
+ }
+
+ el.textContent=Notification.permission==="granted"
+   ?"Enabled"
+   :Notification.permission==="denied"
+     ?"Blocked in browser settings"
+     :"Not enabled";
+}
+
+function showSystemNotification(title,body,target){
+ if(!("Notification" in window)||Notification.permission!=="granted")return;
+
+ try{
+   const n=new Notification(title,{
+     body,
+     icon:"/static/spookchat_pfp.png",
+     badge:"/static/spookchat_pfp.png",
+     tag:`vyntra-${target.kind}-${target.server_id||target.chat_id||target.channel||""}`,
+     renotify:true
+   });
+
+   n.onclick=()=>{
+     window.focus();
+
+     if(target.kind==="public"){
+       openPublic(target.channel);
+     }else if(target.kind==="dm"){
+       openChat(target.chat_id);
+     }else if(target.kind==="server"){
+       openServer(target.server_id,target.channel);
+     }
+
+     n.close();
+   };
+
+ }catch(e){}
+}
+
 function notificationBellButton(){
  return `<button class="roundBtn notificationBell" onclick="showNotifications()" title="Notifications">🔔<span class="notifyBadge ${state.unreadCount?"":"hidden"}">${state.unreadCount||""}</span></button>`;
 }
@@ -3644,6 +3989,18 @@ async function loadMessages(force=false){
    if(force||needsFreshPaint||sig!==state.lastMessageSignature){
      state.lastMessageSignature=sig;
      drawMessages();
+   }
+
+   // Reading is tied to actually opening/loading this exact conversation.
+   // Do not mark unrelated background conversations as read.
+   if(
+     document.visibilityState==="visible" &&
+     state.view===viewAtStart &&
+     state.channel===channelAtStart &&
+     state.activeServer===serverAtStart &&
+     state.activeChat===chatAtStart
+   ){
+     markCurrentConversationRead();
    }
 
  }catch(e){
@@ -4430,7 +4787,7 @@ async function startDM(uid){
    toast(e.message);
  }
 }
-function drawChats(list){chatList.innerHTML=list.length?list.map(c=>`<button class="sideBtn" onclick="openChat(${c.id})"><span class="iconBox">${c.kind==="group"?"👥":"💬"}</span>${esc(c.display_name)}</button>`).join(""):`<div class="muted">No DMs or groups yet.</div>`}
+function drawChats(list){chatList.innerHTML=list.length?list.map(c=>`<button class="sideBtn" data-unread-scope="dm" data-chat-id="${c.id}" onclick="openChat(${c.id})"><span class="iconBox">${c.kind==="group"?"👥":"💬"}</span>${esc(c.display_name)}</button>`).join(""):`<div class="muted">No DMs or groups yet.</div>`}
 async function openChat(id){
  state.view="dm";
  state.activeChat=id;
@@ -4702,7 +5059,7 @@ function renderServer(){
    <div class="serverChannelRail">
      <div class="sectionTitle serverChannelTitle"><span>Channels</span>${hasServerPerm("manage_channels")?`<button class="roundBtn" style="width:25px;height:25px" onclick="createChannelPrompt()">＋</button>`:""}</div>
      <div class="serverChannelButtons">
-       ${state.serverChannels.map(c=>`<div class="mobileChannelWrap"><button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}</button>${hasServerPerm("manage_channels")?`<button class="mobileChannelEditBtn" onclick="event.stopPropagation();channelSettings(${c.id})" title="Edit channel">⚙</button>`:""}</div>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
+       ${state.serverChannels.map(c=>`<div class="mobileChannelWrap"><button class="channelBtn ${Number(state.channel)===Number(c.id)?"active":""}" data-unread-scope="server-channel" data-server-id="${s.id}" data-channel="${c.id}" onclick="openServer(${s.id},${c.id})" oncontextmenu="channelMenu(event,${c.id})">${c.kind==="announcement"?"📢":"#"} ${esc(c.name)}${badgeHtml(state.unreads.servers?.[String(s.id)]?.[String(c.id)]?.count)}</button>${hasServerPerm("manage_channels")?`<button class="mobileChannelEditBtn" onclick="event.stopPropagation();channelSettings(${c.id})" title="Edit channel">⚙</button>`:""}</div>`).join("")||'<div class="muted" style="padding:10px">No visible channels</div>'}
      </div>
    </div>
    <div class="serverConversation">
@@ -5035,7 +5392,17 @@ function renderSettings(){
  <form class="formGrid" onsubmit="changePassword(event)" style="margin-top:14px"><div class="label">New password</div><input id="newPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters"><button class="ghost">Change password</button></form></div>
  <div class="card"><h3>Notifications</h3><div class="muted" style="margin-bottom:12px">VYNTRA can show a Windows/browser popup when a new DM or group message arrives while the app is in the background.</div><div class="row"><button class="primary" type="button" onclick="enableDesktopNotifications()">Enable desktop notifications</button><button class="ghost" type="button" onclick="disableDesktopNotifications()">Disable</button></div></div>
  <div class="card"><h3>Desktop App</h3><div class="muted" style="margin-bottom:12px">Install the Windows desktop version of VYNTRA.</div><a class="primary" href="/static/downloads/VYNTRAPCSet-up.exe" download="VYNTRAPCSet-up.exe" style="display:inline-block;text-decoration:none">Download VYNTRA for Windows</a></div>
- ${state.profile.global_role==="owner"?`<div class="card"><h3>Owner Security</h3><div class="muted" style="margin-bottom:12px">Set a separate password required before viewing sensitive moderation account records.</div><form class="formGrid" onsubmit="setAccountInfoPassword(event)"><div class="label">Account Info Access Password</div><input id="accountInfoAccessPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters" required><button class="primary">Set / Change Access Password</button></form></div>`:""}${state.profile.global_role==="owner"?`<div class="card"><h3>Owner</h3><button class="primary" onclick="showOwnerPanel()">Open Owner Control Center</button></div>`:""}<div class="card"><h3>Session</h3><button class="danger" onclick="logout()">Log out of VYNTRA</button></div></div></div></div>`;
+ ${state.profile.global_role==="owner"?`<div class="card"><h3>Owner Security</h3><div class="muted" style="margin-bottom:12px">Set a separate password required before viewing sensitive moderation account records.</div><form class="formGrid" onsubmit="setAccountInfoPassword(event)"><div class="label">Account Info Access Password</div><input id="accountInfoAccessPassword" class="field" type="password" minlength="8" placeholder="At least 8 characters" required><button class="primary">Set / Change Access Password</button></form></div>`:""}${state.profile.global_role==="owner"?`<div class="card"><h3>Owner</h3><button class="primary" onclick="showOwnerPanel()">Open Owner Control Center</button></div>`:""}<div class="card"><h3>Session</h3><button class="danger" onclick="logout()">Log out of VYNTRA</button></div></div></div><div class="card">
+   <div class="row between">
+     <div>
+       <h3 style="margin:0">System Notifications</h3>
+       <div class="muted" style="margin-top:5px">Show normal phone/PC notifications for new messages while VYNTRA is open or running in the background.</div>
+     </div>
+     <button class="primary" onclick="requestSystemNotifications()">Enable Notifications</button>
+   </div>
+   <div class="listSub" style="margin-top:10px">Status: <b id="notificationPermissionState">Checking...</b></div>
+ </div>
+ </div>`;
 }
 async function saveProfile(e){e.preventDefault();try{const d=await api("/api/profile",{method:"PATCH",body:JSON.stringify({username:setUsername.value,pronouns:setPronouns.value,company:setCompany.value,avatar:setAvatar.value,description:setDescription.value})});state.profile=d.profile;state.servers=(await api("/api/servers")).servers;toast("Profile saved");renderApp()}catch(e){toast(e.message)}}
 async function changePassword(e){e.preventDefault();try{await api("/api/account/password",{method:"POST",body:JSON.stringify({password:newPassword.value})});newPassword.value="";toast("Password changed")}catch(e){toast(e.message)}}
@@ -5784,6 +6151,16 @@ async function joinInviteCode(code){
 
 async function logout(){await api("/api/logout",{method:"POST"});location.reload()}
 boot();
+
+document.addEventListener("visibilitychange",()=>{
+ if(document.visibilityState==="visible"){
+   loadUnreadCounts(false);
+   if(["public","server","dm"].includes(state.view)){
+     loadMessages(true);
+   }
+ }
+});
+
 </script>
 </body>
 </html>
@@ -8765,6 +9142,231 @@ def typing_update():
 
     return jsonify(ok=True)
 
+
+
+@app.post("/api/read-state")
+@login_required
+def mark_scope_read():
+    d=request.get_json(silent=True) or {}
+    kind=str(d.get("kind",""))
+    channel=d.get("channel")
+    sid=d.get("server_id")
+    cid=d.get("chat_id")
+
+    try:
+        scope=message_scope_key(kind,channel,sid,cid)
+    except Exception:
+        return jsonify(error="Invalid conversation"),400
+
+    if not scope:
+        return jsonify(error="Invalid conversation"),400
+
+    with connect() as c:
+        if kind=="public":
+            row=c.execute("""
+                select coalesce(max(id),0)
+                from messages
+                where kind='public' and channel=%s
+            """,(channel,)).fetchone()
+
+        elif kind=="server":
+            try:
+                sid=int(sid)
+                channel=str(int(channel))
+            except Exception:
+                return jsonify(error="Invalid server channel"),400
+
+            sm,perms=channel_effective_permissions(
+                sid,int(channel),request.me["id"]
+            )
+
+            if not sm or "view_channels" not in perms:
+                return jsonify(error="No channel access"),403
+
+            row=c.execute("""
+                select coalesce(max(id),0)
+                from messages
+                where kind='server' and server_id=%s and channel=%s
+            """,(sid,channel)).fetchone()
+
+        elif kind=="dm":
+            try:
+                cid=int(cid)
+            except Exception:
+                return jsonify(error="Invalid chat"),400
+
+            ok=c.execute("""
+                select 1
+                from chat_members
+                where chat_id=%s and user_id=%s
+            """,(cid,request.me["id"])).fetchone()
+
+            if not ok:
+                return jsonify(error="Not a chat member"),403
+
+            row=c.execute("""
+                select coalesce(max(id),0)
+                from messages
+                where kind='dm' and chat_id=%s
+            """,(cid,)).fetchone()
+
+        else:
+            return jsonify(error="Invalid conversation"),400
+
+        last_id=int(row[0] or 0)
+
+        c.execute("""
+            insert into message_read_state(
+                user_id,scope_key,last_message_id,updated_at
+            )
+            values(%s,%s,%s,now())
+            on conflict(user_id,scope_key)
+            do update set
+                last_message_id=greatest(
+                    message_read_state.last_message_id,
+                    excluded.last_message_id
+                ),
+                updated_at=now()
+        """,(request.me["id"],scope,last_id))
+
+        c.commit()
+
+    return jsonify(ok=True,last_message_id=last_id)
+
+
+@app.get("/api/unreads")
+@login_required
+def unread_counts():
+    uid=request.me["id"]
+
+    with connect() as c:
+        states={
+            r[0]:int(r[1] or 0)
+            for r in c.execute("""
+                select scope_key,last_message_id
+                from message_read_state
+                where user_id=%s
+            """,(uid,)).fetchall()
+        }
+
+        public_rows=c.execute("""
+            select channel,count(*),max(id)
+            from messages
+            where kind='public' and user_id<>%s
+            group by channel
+        """,(uid,)).fetchall()
+
+        dm_rows=c.execute("""
+            select m.chat_id,count(*),max(m.id)
+            from messages m
+            join chat_members cm
+              on cm.chat_id=m.chat_id
+             and cm.user_id=%s
+            where m.kind='dm' and m.user_id<>%s
+            group by m.chat_id
+        """,(uid,uid)).fetchall()
+
+        server_rows=c.execute("""
+            select m.server_id,m.channel,count(*),max(m.id)
+            from messages m
+            where m.kind='server'
+              and m.user_id<>%s
+            group by m.server_id,m.channel
+        """,(uid,)).fetchall()
+
+        # Exact unread counts require counting messages newer than each
+        # user's last-read id. Do it in one query per messaging family.
+        public_unreads=c.execute("""
+            select m.channel,count(*),max(m.id)
+            from messages m
+            where m.kind='public'
+              and m.user_id<>%s
+              and m.id > coalesce((
+                  select rs.last_message_id
+                  from message_read_state rs
+                  where rs.user_id=%s
+                    and rs.scope_key='public:'||m.channel
+              ),0)
+            group by m.channel
+        """,(uid,uid)).fetchall()
+
+        dm_unreads=c.execute("""
+            select m.chat_id,count(*),max(m.id)
+            from messages m
+            join chat_members cm
+              on cm.chat_id=m.chat_id
+             and cm.user_id=%s
+            where m.kind='dm'
+              and m.user_id<>%s
+              and m.id > coalesce((
+                  select rs.last_message_id
+                  from message_read_state rs
+                  where rs.user_id=%s
+                    and rs.scope_key='dm:'||m.chat_id::text
+              ),0)
+            group by m.chat_id
+        """,(uid,uid,uid)).fetchall()
+
+        # Server unread rows are filtered in Python against current channel
+        # visibility so private channels do not leak through counts.
+        raw_server_unreads=c.execute("""
+            select m.server_id,m.channel,count(*),max(m.id)
+            from messages m
+            where m.kind='server'
+              and m.user_id<>%s
+              and m.id > coalesce((
+                  select rs.last_message_id
+                  from message_read_state rs
+                  where rs.user_id=%s
+                    and rs.scope_key=
+                        'server:'||m.server_id::text||':'||m.channel
+              ),0)
+            group by m.server_id,m.channel
+        """,(uid,uid)).fetchall()
+
+    public_map={
+        str(r[0]):{"count":int(r[1]),"last_message_id":int(r[2])}
+        for r in public_unreads
+    }
+
+    dm_map={
+        str(r[0]):{"count":int(r[1]),"last_message_id":int(r[2])}
+        for r in dm_unreads
+    }
+
+    server_map={}
+    server_totals={}
+
+    for sid,channel,count,last_mid in raw_server_unreads:
+        try:
+            cid=int(channel)
+        except Exception:
+            continue
+
+        sm,perms=channel_effective_permissions(sid,cid,uid)
+
+        if not sm or "view_channels" not in perms:
+            continue
+
+        server_map.setdefault(str(sid),{})[str(channel)]={
+            "count":int(count),
+            "last_message_id":int(last_mid)
+        }
+
+        server_totals[str(sid)]=server_totals.get(str(sid),0)+int(count)
+
+    return jsonify(
+        public=public_map,
+        dms=dm_map,
+        servers=server_map,
+        server_totals=server_totals,
+        friends_total=sum(v["count"] for v in dm_map.values()),
+        total=(
+            sum(v["count"] for v in public_map.values())
+            + sum(v["count"] for v in dm_map.values())
+            + sum(server_totals.values())
+        )
+    )
 
 @app.get("/api/typing")
 @login_required
