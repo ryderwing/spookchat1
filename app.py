@@ -589,19 +589,55 @@ def typing_scope_key(kind,channel=None,server_id=None,chat_id=None):
 
 
 
+
+# Vyntra Bot security boundary:
+# Bot tokens authenticate ONLY /api/bot/v1/* routes.
+# They do not authenticate browser/user APIs, owner controls, staff APIs,
+# account endpoints, database access, server deletion, or ownership transfer.
+
 BOT_PERMISSION_KEYS = [
+    "administrator",
     "view_channels",
     "read_messages",
     "send_messages",
     "embed_links",
     "add_reactions",
-    "manage_messages"
+    "manage_messages",
+    "manage_channels",
+    "manage_roles",
+    "manage_members",
+    "mute_members",
+    "ban_members",
+    "invite_members",
+    "manage_server"
 ]
+
+BOT_ADMIN_PERMISSIONS = {
+    "view_channels",
+    "read_messages",
+    "send_messages",
+    "embed_links",
+    "add_reactions",
+    "manage_messages",
+    "manage_channels",
+    "manage_roles",
+    "manage_members",
+    "mute_members",
+    "ban_members",
+    "invite_members",
+    "manage_server"
+}
 
 def normalize_bot_permissions(value):
     if not isinstance(value,(list,tuple,set)):
         return set()
-    return {str(x) for x in value if str(x) in BOT_PERMISSION_KEYS}
+
+    perms={str(x) for x in value if str(x) in BOT_PERMISSION_KEYS}
+
+    if "administrator" in perms:
+        perms |= set(BOT_ADMIN_PERMISSIONS)
+
+    return perms
 
 def can_install_bot_to_server(sid,uid):
     sm=server_member(sid,uid)
@@ -2699,6 +2735,14 @@ body.theme-light .replyBar{
   .sideBtn[onclick="showBeta()"]{display:none!important}
 }
 
+
+.botAdminPermission{
+  border:1px solid rgba(168,85,247,.22);
+  border-radius:14px;
+  padding:10px!important;
+  background:rgba(168,85,247,.055);
+}
+
 </style>
 </head>
 <body>
@@ -2713,7 +2757,7 @@ const state={
  servers:[], activeServer:null, serverInfo:null, serverMembers:[],serverChannels:[],serverRoles:[],
  activeChat:null, poll:null,notifPoll:null,notifications:[],unreadCount:0,lastSeenUnread:0,replyingTo:null,
  messagesLoading:false,lastMessageSignature:"",sendingMessage:false,
- typingPoll:null,lastTypingSent:0,typingUsers:[]
+ typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -2935,6 +2979,7 @@ function updateNotificationBadges(){
 function renderApp(){
  clearInterval(state.poll);
  clearInterval(state.typingPoll);
+ clearInterval(state.memberPoll);
  root.innerHTML=`<div id="appShell" class="app">${sidebar()}<main class="main"><div id="mainArea" style="height:100%;display:flex;flex-direction:column"></div></main><aside id="membersPane" class="membersPane"></aside></div>${mobilebar()}`;
  if(state.view==="friends")renderFriendsPage();
  else if(state.view==="settings")renderSettings();
@@ -3527,17 +3572,43 @@ async function joinServer(id){
 function serverCreate(){modalOpen("Create server",`<form class="formGrid" onsubmit="makeServer(event)"><div class="label">Server name</div><input id="newServerName" class="field" maxlength="60" required><div class="label">Server picture URL (optional)</div><input id="newServerIcon" class="field" maxlength="500"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create server</button></div></form>`)}
 async function makeServer(e){e.preventDefault();try{await api("/api/servers",{method:"POST",body:JSON.stringify({name:newServerName.value,icon:newServerIcon.value})});modalClose();state.servers=(await api("/api/servers")).servers;renderApp()}catch(e){toast(e.message)}}
 async function openServer(id,ch=null){
- state.view="server";state.activeServer=Number(id);
+ const wantedServer=Number(id);
+
+ // Change navigation immediately, but don't render an empty/wrong server.
+ state.view="server";
+ state.activeServer=wantedServer;
+
  try{
-   state.serverInfo=(await api("/api/servers/"+id)).server;
-   state.serverMembers=(await api("/api/servers/"+id+"/members")).members;
-   state.serverChannels=(await api("/api/servers/"+id+"/channels")).channels;
-   state.serverRoles=(await api("/api/servers/"+id+"/roles")).roles;
-   if(ch && !Number.isNaN(Number(ch)))state.channel=Number(ch);
-   else if(ch){const found=state.serverChannels.find(c=>c.name===ch||c.name===String(ch).replace("announcement","announcements"));state.channel=found?found.id:(state.serverChannels[0]?.id||null)}
-   else if(!state.serverChannels.some(c=>Number(c.id)===Number(state.channel)))state.channel=state.serverChannels[0]?.id||null;
-   renderApp()
- }catch(e){toast(e.message)}
+   const d=await api(`/api/servers/${wantedServer}/bootstrap`);
+
+   // Ignore an old response if the user navigated elsewhere while loading.
+   if(state.view!=="server"||state.activeServer!==wantedServer)return;
+
+   state.serverInfo=d.server;
+   state.serverMembers=d.members||[];
+   state.serverChannels=d.channels||[];
+   state.serverRoles=d.roles||[];
+
+   if(ch && !Number.isNaN(Number(ch))){
+     state.channel=Number(ch);
+   }else if(ch){
+     const found=state.serverChannels.find(c=>
+       c.name===ch||
+       c.name===String(ch).replace("announcement","announcements")
+     );
+     state.channel=found?found.id:(state.serverChannels[0]?.id||null);
+   }else if(!state.serverChannels.some(c=>Number(c.id)===Number(state.channel))){
+     state.channel=state.serverChannels[0]?.id||null;
+   }
+
+   state.lastMessageSignature="";
+   renderApp();
+
+ }catch(e){
+   if(state.view==="server"&&state.activeServer===wantedServer){
+     toast(e.message);
+   }
+ }
 }
 
 function showMobileServerActions(){
@@ -3572,8 +3643,27 @@ function renderServer(){
    </div>
  </div>`;
  renderMembers();
- loadMessages();attachTypingListener();state.poll=setInterval(loadMessages,2000);
+ loadMessages();
+ attachTypingListener();
+ state.poll=setInterval(loadMessages,2200);
+ state.memberPoll=setInterval(refreshActiveServerMembers,15000);
 }
+
+async function refreshActiveServerMembers(){
+ if(state.view!=="server"||!state.activeServer)return;
+
+ const sid=state.activeServer;
+ try{
+   const d=await api(`/api/servers/${sid}/members`);
+
+   if(state.view!=="server"||state.activeServer!==sid)return;
+
+   state.serverMembers=d.members||[];
+   renderMembers();
+
+ }catch(e){}
+}
+
 function renderMembers(){
  const p=document.getElementById("membersPane");if(!p)return;
  p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${m.online?"● Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
@@ -3995,12 +4085,20 @@ async function loadOwnerAudit(){
 
 
 const BOT_PERMISSION_LABELS={
+ administrator:["Administrator","Gives the bot every VYNTRA server-level bot permission. Does not grant website Owner/Admin access and cannot delete servers or access private website internals."],
  view_channels:["View Channels","Allows the bot to see the server channel list."],
  read_messages:["Read Message History","Allows the bot API to read recent channel messages."],
  send_messages:["Send Messages","Allows the bot to send messages into server channels."],
- embed_links:["Embed Links","Reserved for bot messages that include links."],
+ embed_links:["Embed Links","Allows bot messages to include link previews where supported."],
  add_reactions:["Add Reactions","Allows the bot to react to messages."],
- manage_messages:["Manage Messages","Allows the bot to delete messages it does not own."]
+ manage_messages:["Manage Messages","Allows the bot to delete messages it does not own."],
+ manage_channels:["Manage Channels","Allows creating, renaming, and deleting server channels."],
+ manage_roles:["Manage Roles","Allows creating, editing, and deleting custom server roles."],
+ manage_members:["Manage Members","Allows reading and managing server member information."],
+ mute_members:["Mute Members","Allows muting and unmuting server members."],
+ ban_members:["Ban Members","Allows banning and unbanning server members, except the server owner."],
+ invite_members:["Invite Members","Allows the bot to create server invite links."],
+ manage_server:["Manage Server","Allows changing the server name and icon. It cannot delete the server or transfer ownership."]
 };
 
 function showBeta(){
@@ -4019,13 +4117,32 @@ async function renderBeta(){
    <div id="botList" class="grid2"><div class="muted">Loading bots...</div></div>
    <div class="card"><h3>Bot API</h3><div class="muted">Use your bot token in the Authorization header. Keep the token secret.</div><pre class="botCode">Authorization: Bot YOUR_BOT_TOKEN
 
-GET  /api/bot/v1/me
-GET  /api/bot/v1/servers
-GET  /api/bot/v1/servers/&lt;server_id&gt;/channels
-GET  /api/bot/v1/channels/&lt;channel_id&gt;/messages
-POST /api/bot/v1/channels/&lt;channel_id&gt;/messages
+GET    /api/bot/v1/me
+GET    /api/bot/v1/servers
+
+GET    /api/bot/v1/servers/&lt;server_id&gt;/channels
+POST   /api/bot/v1/servers/&lt;server_id&gt;/channels
+PATCH  /api/bot/v1/channels/&lt;channel_id&gt;
+DELETE /api/bot/v1/channels/&lt;channel_id&gt;
+
+GET    /api/bot/v1/channels/&lt;channel_id&gt;/messages
+POST   /api/bot/v1/channels/&lt;channel_id&gt;/messages
 DELETE /api/bot/v1/messages/&lt;message_id&gt;
-POST /api/bot/v1/messages/&lt;message_id&gt;/reactions</pre></div>
+POST   /api/bot/v1/messages/&lt;message_id&gt;/reactions
+
+GET    /api/bot/v1/servers/&lt;server_id&gt;/roles
+POST   /api/bot/v1/servers/&lt;server_id&gt;/roles
+PATCH  /api/bot/v1/servers/&lt;server_id&gt;/roles/&lt;role_id&gt;
+DELETE /api/bot/v1/servers/&lt;server_id&gt;/roles/&lt;role_id&gt;
+
+GET    /api/bot/v1/servers/&lt;server_id&gt;/members
+POST   /api/bot/v1/servers/&lt;server_id&gt;/members/&lt;user_id&gt;/mute
+POST   /api/bot/v1/servers/&lt;server_id&gt;/members/&lt;user_id&gt;/unmute
+POST   /api/bot/v1/servers/&lt;server_id&gt;/members/&lt;user_id&gt;/ban
+POST   /api/bot/v1/servers/&lt;server_id&gt;/members/&lt;user_id&gt;/unban
+
+PATCH  /api/bot/v1/servers/&lt;server_id&gt;
+POST   /api/bot/v1/servers/&lt;server_id&gt;/invites</pre></div>
  </div>`;
  await loadBots();
 }
@@ -4033,14 +4150,29 @@ POST /api/bot/v1/messages/&lt;message_id&gt;/reactions</pre></div>
 function botPermissionChecks(selected=[]){
  const have=new Set(selected||[]);
  return Object.entries(BOT_PERMISSION_LABELS).map(([key,[name,desc]])=>`
- <label class="listItem botPermissionRow" style="cursor:pointer">
-   <input type="checkbox" data-botperm="${key}" ${have.has(key)?"checked":""}>
-   <div class="listMain"><div class="listTitle">${name}</div><div class="listSub">${desc}</div></div>
+ <label class="listItem botPermissionRow ${key==="administrator"?"botAdminPermission":""}" style="cursor:pointer">
+   <input type="checkbox" data-botperm="${key}" ${have.has(key)?"checked":""} onchange="botPermissionChanged(this)">
+   <div class="listMain"><div class="listTitle">${name}${key==="administrator"?` <span class="roleTag">ALL SERVER PERMISSIONS</span>`:""}</div><div class="listSub">${desc}</div></div>
  </label>`).join("");
 }
 
+function botPermissionChanged(el){
+ if(el.dataset.botperm!=="administrator")return;
+
+ document.querySelectorAll("[data-botperm]").forEach(box=>{
+   if(box!==el){
+     box.checked=el.checked;
+     box.disabled=el.checked;
+   }
+ });
+}
+
 function collectBotPermissions(){
- return [...document.querySelectorAll("[data-botperm]:checked")].map(x=>x.dataset.botperm);
+ const checked=[...document.querySelectorAll("[data-botperm]:checked")].map(x=>x.dataset.botperm);
+ if(checked.includes("administrator")){
+   return ["administrator"];
+ }
+ return checked;
 }
 
 async function loadBots(){
@@ -4590,6 +4722,456 @@ def bot_api_react(mid):
         c.commit()
 
     return jsonify(ok=True,added=added)
+
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/channels")
+@bot_auth_required
+def bot_api_create_channel(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_channels" not in perms:
+        return jsonify(error="Bot lacks Manage Channels permission"),403
+
+    d=request.get_json(silent=True) or {}
+    name=str(d.get("name","")).strip().lower().replace(" ","-")[:40]
+    kind=str(d.get("kind","chat"))
+
+    if not name:
+        return jsonify(error="Channel name required"),400
+    if kind not in ("chat","announcement"):
+        return jsonify(error="Invalid channel type"),400
+
+    with connect() as c:
+        installed=c.execute("""
+            select 1 from bot_server_installs
+            where bot_id=%s and server_id=%s
+        """,(request.bot["id"],sid)).fetchone()
+        if not installed:
+            return jsonify(error="Bot is not installed in this server"),403
+
+        pos=c.execute(
+            "select coalesce(max(position),0)+1 from server_channels where server_id=%s",
+            (sid,)
+        ).fetchone()[0]
+
+        cid=c.execute("""
+            insert into server_channels(server_id,name,kind,position)
+            values(%s,%s,%s,%s)
+            returning id
+        """,(sid,name,kind,pos)).fetchone()[0]
+        c.commit()
+
+    return jsonify(id=cid,name=name,kind=kind)
+
+
+@app.patch("/api/bot/v1/channels/<int:cid>")
+@bot_auth_required
+def bot_api_edit_channel(cid):
+    d=request.get_json(silent=True) or {}
+
+    with connect() as c:
+        row=c.execute(
+            "select server_id,name from server_channels where id=%s",
+            (cid,)
+        ).fetchone()
+        if not row:
+            return jsonify(error="Channel not found"),404
+
+        sid=row[0]
+        perms=bot_install_permissions(request.bot["id"],sid)
+        if "manage_channels" not in perms:
+            return jsonify(error="Bot lacks Manage Channels permission"),403
+
+        name=str(d.get("name",row[1])).strip().lower().replace(" ","-")[:40]
+        if not name:
+            return jsonify(error="Channel name required"),400
+
+        c.execute(
+            "update server_channels set name=%s where id=%s",
+            (name,cid)
+        )
+        c.commit()
+
+    return jsonify(ok=True,name=name)
+
+
+@app.delete("/api/bot/v1/channels/<int:cid>")
+@bot_auth_required
+def bot_api_delete_channel(cid):
+    with connect() as c:
+        row=c.execute(
+            "select server_id from server_channels where id=%s",
+            (cid,)
+        ).fetchone()
+        if not row:
+            return jsonify(error="Channel not found"),404
+
+        sid=row[0]
+        perms=bot_install_permissions(request.bot["id"],sid)
+        if "manage_channels" not in perms:
+            return jsonify(error="Bot lacks Manage Channels permission"),403
+
+        count=c.execute(
+            "select count(*) from server_channels where server_id=%s",
+            (sid,)
+        ).fetchone()[0]
+
+        if count<=1:
+            return jsonify(error="A server must keep at least one channel"),400
+
+        c.execute("delete from server_channels where id=%s",(cid,))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.get("/api/bot/v1/servers/<int:sid>/roles")
+@bot_auth_required
+def bot_api_roles(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_roles" not in perms:
+        return jsonify(error="Bot lacks Manage Roles permission"),403
+
+    with connect() as c:
+        rows=c.execute("""
+            select id,name,permissions
+            from server_roles
+            where server_id=%s
+            order by id
+        """,(sid,)).fetchall()
+
+    return jsonify(roles=[
+        {"id":r[0],"name":r[1],"permissions":r[2] or {}}
+        for r in rows
+    ])
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/roles")
+@bot_auth_required
+def bot_api_create_role(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_roles" not in perms:
+        return jsonify(error="Bot lacks Manage Roles permission"),403
+
+    d=request.get_json(silent=True) or {}
+    name=str(d.get("name","")).strip()[:30]
+    raw=d.get("permissions") or {}
+
+    if not name:
+        return jsonify(error="Role name required"),400
+
+    role_perms={
+        k:bool(raw.get(k,False))
+        for k in SERVER_PERMISSION_KEYS
+    } if isinstance(raw,dict) else {}
+
+    with connect() as c:
+        rid=c.execute("""
+            insert into server_roles(server_id,name,permissions)
+            values(%s,%s,%s)
+            returning id
+        """,(sid,name,psycopg.types.json.Jsonb(role_perms))).fetchone()[0]
+        c.commit()
+
+    return jsonify(id=rid)
+
+
+@app.patch("/api/bot/v1/servers/<int:sid>/roles/<int:rid>")
+@bot_auth_required
+def bot_api_edit_role(sid,rid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_roles" not in perms:
+        return jsonify(error="Bot lacks Manage Roles permission"),403
+
+    d=request.get_json(silent=True) or {}
+
+    with connect() as c:
+        old=c.execute(
+            "select name,permissions from server_roles where id=%s and server_id=%s",
+            (rid,sid)
+        ).fetchone()
+        if not old:
+            return jsonify(error="Role not found"),404
+
+        name=str(d.get("name",old[0])).strip()[:30]
+        raw=d.get("permissions",old[1] or {})
+        role_perms={
+            k:bool(raw.get(k,False))
+            for k in SERVER_PERMISSION_KEYS
+        } if isinstance(raw,dict) else old[1]
+
+        c.execute("""
+            update server_roles
+            set name=%s,permissions=%s
+            where id=%s and server_id=%s
+        """,(name,psycopg.types.json.Jsonb(role_perms),rid,sid))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.delete("/api/bot/v1/servers/<int:sid>/roles/<int:rid>")
+@bot_auth_required
+def bot_api_delete_role(sid,rid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_roles" not in perms:
+        return jsonify(error="Bot lacks Manage Roles permission"),403
+
+    with connect() as c:
+        c.execute(
+            "delete from server_roles where id=%s and server_id=%s",
+            (rid,sid)
+        )
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.get("/api/bot/v1/servers/<int:sid>/members")
+@bot_auth_required
+def bot_api_members(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_members" not in perms and "view_channels" not in perms:
+        return jsonify(error="Bot lacks member access permission"),403
+
+    with connect() as c:
+        rows=c.execute("""
+            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until
+            from server_members sm
+            join users u on u.id=sm.user_id
+            where sm.server_id=%s
+            order by lower(u.username)
+        """,(sid,)).fetchall()
+
+    now=datetime.now(timezone.utc)
+
+    return jsonify(members=[
+        {
+            "id":r[0],
+            "username":r[1],
+            "avatar":r[2],
+            "role":r[3],
+            "muted":bool(r[4] and r[4]>now),
+            "banned":bool(r[5] and r[5]>now)
+        }
+        for r in rows
+    ])
+
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/moderate")
+@bot_auth_required
+def bot_api_moderate_member(sid,uid):
+    d=request.get_json(silent=True) or {}
+    action=str(d.get("action","")).lower().strip()
+
+    if action not in ("mute","unmute","ban","unban"):
+        return jsonify(error="Invalid moderation action"),400
+
+    required={
+        "mute":"mute_members",
+        "unmute":"mute_members",
+        "ban":"ban_members",
+        "unban":"ban_members"
+    }[action]
+
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if required not in perms:
+        return jsonify(error=f"Bot lacks {required.replace('_',' ').title()} permission"),403
+
+    with connect() as c:
+        target=c.execute(
+            "select role from server_members where server_id=%s and user_id=%s",
+            (sid,uid)
+        ).fetchone()
+
+        if not target:
+            return jsonify(error="Member not found"),404
+
+        if target[0]=="owner":
+            return jsonify(error="Cannot moderate the server owner"),403
+
+        if action in ("mute","ban"):
+            try:
+                mins=max(1,min(int(d.get("minutes") or 60),525600))
+            except Exception:
+                mins=60
+            until=datetime.now(timezone.utc)+timedelta(minutes=mins)
+
+            field="muted_until" if action=="mute" else "banned_until"
+            c.execute(
+                f"update server_members set {field}=%s where server_id=%s and user_id=%s",
+                (until,sid,uid)
+            )
+            c.commit()
+            return jsonify(ok=True,action=action,until=until.isoformat())
+
+        field="muted_until" if action=="unmute" else "banned_until"
+        c.execute(
+            f"update server_members set {field}=null where server_id=%s and user_id=%s",
+            (sid,uid)
+        )
+        c.commit()
+
+    return jsonify(ok=True,action=action)
+
+@app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/mute")
+@bot_auth_required
+def bot_api_mute_member(sid,uid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "mute_members" not in perms:
+        return jsonify(error="Bot lacks Mute Members permission"),403
+
+    d=request.get_json(silent=True) or {}
+    mins=max(1,min(int(d.get("minutes") or 60),525600))
+    until=datetime.now(timezone.utc)+timedelta(minutes=mins)
+
+    with connect() as c:
+        target=c.execute(
+            "select role from server_members where server_id=%s and user_id=%s",
+            (sid,uid)
+        ).fetchone()
+        if not target:
+            return jsonify(error="Member not found"),404
+        if target[0]=="owner":
+            return jsonify(error="Cannot mute the server owner"),403
+
+        c.execute("""
+            update server_members
+            set muted_until=%s
+            where server_id=%s and user_id=%s
+        """,(until,sid,uid))
+        c.commit()
+
+    return jsonify(ok=True,muted_until=until.isoformat())
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/unmute")
+@bot_auth_required
+def bot_api_unmute_member(sid,uid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "mute_members" not in perms:
+        return jsonify(error="Bot lacks Mute Members permission"),403
+
+    with connect() as c:
+        c.execute("""
+            update server_members
+            set muted_until=null
+            where server_id=%s and user_id=%s
+        """,(sid,uid))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/ban")
+@bot_auth_required
+def bot_api_ban_member(sid,uid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "ban_members" not in perms:
+        return jsonify(error="Bot lacks Ban Members permission"),403
+
+    d=request.get_json(silent=True) or {}
+    mins=max(1,min(int(d.get("minutes") or 525600),525600))
+    until=datetime.now(timezone.utc)+timedelta(minutes=mins)
+
+    with connect() as c:
+        target=c.execute(
+            "select role from server_members where server_id=%s and user_id=%s",
+            (sid,uid)
+        ).fetchone()
+        if not target:
+            return jsonify(error="Member not found"),404
+        if target[0]=="owner":
+            return jsonify(error="Cannot ban the server owner"),403
+
+        c.execute("""
+            update server_members
+            set banned_until=%s
+            where server_id=%s and user_id=%s
+        """,(until,sid,uid))
+        c.commit()
+
+    return jsonify(ok=True,banned_until=until.isoformat())
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/members/<int:uid>/unban")
+@bot_auth_required
+def bot_api_unban_member(sid,uid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "ban_members" not in perms:
+        return jsonify(error="Bot lacks Ban Members permission"),403
+
+    with connect() as c:
+        c.execute("""
+            update server_members
+            set banned_until=null
+            where server_id=%s and user_id=%s
+        """,(sid,uid))
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.patch("/api/bot/v1/servers/<int:sid>")
+@bot_auth_required
+def bot_api_edit_server(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "manage_server" not in perms:
+        return jsonify(error="Bot lacks Manage Server permission"),403
+
+    d=request.get_json(silent=True) or {}
+
+    with connect() as c:
+        old=c.execute(
+            "select name,icon from servers where id=%s",
+            (sid,)
+        ).fetchone()
+        if not old:
+            return jsonify(error="Server not found"),404
+
+        name=str(d.get("name",old[0])).strip()[:60]
+        icon=str(d.get("icon",old[1] or "")).strip()[:1000]
+
+        if not name:
+            return jsonify(error="Server name required"),400
+
+        c.execute(
+            "update servers set name=%s,icon=%s where id=%s",
+            (name,icon,sid)
+        )
+        c.commit()
+
+    return jsonify(ok=True)
+
+
+@app.post("/api/bot/v1/servers/<int:sid>/invites")
+@bot_auth_required
+def bot_api_create_invite(sid):
+    perms=bot_install_permissions(request.bot["id"],sid)
+    if "invite_members" not in perms:
+        return jsonify(error="Bot lacks Invite Members permission"),403
+
+    alphabet="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+    for _ in range(10):
+        code="".join(secrets.choice(alphabet) for _ in range(8))
+        try:
+            with connect() as c:
+                c.execute("""
+                    insert into server_invites(server_id,created_by,code)
+                    values(%s,%s,%s)
+                """,(sid,request.bot["owner_id"],code))
+                c.commit()
+
+            return jsonify(
+                code=code,
+                url=request.host_url.rstrip("/")+"/invite/"+code
+            )
+        except psycopg.errors.UniqueViolation:
+            continue
+
+    return jsonify(error="Could not create invite"),500
 
 
 @app.get("/api/health")
@@ -5350,6 +5932,153 @@ def server_create():
         c.commit()
     return jsonify(id=sid)
 
+
+@app.get("/api/servers/<int:sid>/bootstrap")
+@login_required
+def server_bootstrap(sid):
+    now=datetime.now(timezone.utc)
+
+    with connect() as c:
+        member=c.execute("""
+            select role,banned_until,muted_until,joined_at
+            from server_members
+            where server_id=%s and user_id=%s
+        """,(sid,request.me["id"])).fetchone()
+
+        if not member:
+            return jsonify(error="Not a server member"),403
+
+        server=c.execute("""
+            select s.id,s.name,s.icon,s.owner_id,s.privacy_mode,
+                   (select count(*) from server_members sm where sm.server_id=s.id)
+            from servers s
+            where s.id=%s
+        """,(sid,)).fetchone()
+
+        if not server:
+            return jsonify(error="Server not found"),404
+
+        member_rows=c.execute("""
+            select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until,
+                   u.device_type,u.last_seen
+            from server_members sm
+            join users u on u.id=sm.user_id
+            where sm.server_id=%s
+            order by
+              case sm.role
+                when 'owner' then 3
+                when 'admin' then 2
+                when 'moderator' then 1
+                else 0
+              end desc,
+              lower(u.username)
+        """,(sid,)).fetchall()
+
+        role_rows=c.execute("""
+            select id,name,permissions
+            from server_roles
+            where server_id=%s
+            order by id
+        """,(sid,)).fetchall()
+
+        custom_for_viewer=c.execute("""
+            select sr.id,sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s and smr.user_id=%s
+        """,(sid,request.me["id"])).fetchall()
+
+        channel_rows=c.execute("""
+            select id,name,kind,position
+            from server_channels
+            where server_id=%s
+            order by position,id
+        """,(sid,)).fetchall()
+
+        # Pull all channel overrides once, not once per channel.
+        channel_ids=[r[0] for r in channel_rows]
+        override_rows=[]
+        if channel_ids:
+            override_rows=c.execute("""
+                select channel_id,role_key,allow_permissions,deny_permissions
+                from channel_role_overrides
+                where channel_id=any(%s)
+            """,(channel_ids,)).fetchall()
+
+    sm_role=member[0]
+
+    base=set(BUILTIN_SERVER_PERMISSIONS.get(sm_role,set()))
+    role_keys={sm_role}
+
+    if sm_role=="owner":
+        base=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)|{"delete_server"}
+    else:
+        for rid,raw in custom_for_viewer:
+            role_keys.add(f"custom:{rid}")
+            rp=normalize_permissions(raw)
+            if "administrator" in rp:
+                base|=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)
+            base|=(rp-{"administrator"})
+
+    override_map={}
+    for cid,role_key,allow,deny in override_rows:
+        if role_key not in role_keys:
+            continue
+        slot=override_map.setdefault(cid,{"allow":set(),"deny":set()})
+        slot["allow"]|=set(allow or [])
+        slot["deny"]|=set(deny or [])
+
+    channels=[]
+    for cid,name,kind,position in channel_rows:
+        perms=set(base)
+        ov=override_map.get(cid)
+        if ov:
+            perms-=ov["deny"]
+            perms|=ov["allow"]
+
+        if sm_role=="owner" or "view_channels" in perms:
+            channels.append({
+                "id":cid,
+                "name":name,
+                "kind":kind,
+                "position":position,
+                "can_send":sm_role=="owner" or "send_messages" in perms
+            })
+
+    members=[]
+    for r in member_rows:
+        p=presence_payload(r[7])
+        members.append({
+            "id":r[0],
+            "username":r[1],
+            "avatar":r[2],
+            "role":r[3],
+            "muted":bool(r[4] and r[4]>now),
+            "banned":bool(r[5] and r[5]>now),
+            "device_type":r[6],
+            "online":p["online"],
+            "last_seen":p["last_seen"]
+        })
+
+    return jsonify(
+        server={
+            "id":server[0],
+            "name":server[1],
+            "icon":server[2],
+            "owner_id":server[3],
+            "privacy_mode":server[4],
+            "member_count":server[5],
+            "my_role":sm_role,
+            "permissions":sorted(base)
+        },
+        members=members,
+        channels=channels,
+        roles=[
+            {"id":r[0],"name":r[1],"permissions":r[2] or {}}
+            for r in role_rows
+        ]
+    )
+
 @app.get("/api/servers/<int:sid>")
 @login_required
 def server_get(sid):
@@ -5385,8 +6114,13 @@ def server_edit(sid):
 @login_required
 def server_delete(sid):
     sm=server_member(sid,request.me["id"])
-    if not has_server_permission(sid,request.me["id"],"manage_spookhooks"):return jsonify(error="Manage VyntraHooks permission required"),403
-    with connect() as c:c.execute("delete from servers where id=%s",(sid,));c.commit()
+    if not sm or sm["role"]!="owner":
+        return jsonify(error="Only the server owner can delete the server"),403
+
+    with connect() as c:
+        c.execute("delete from servers where id=%s",(sid,))
+        c.commit()
+
     return jsonify(ok=True)
 
 @app.get("/api/servers/<int:sid>/members")
