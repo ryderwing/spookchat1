@@ -708,7 +708,18 @@ def bot_install_permissions(bot_id,sid):
             from bot_server_installs
             where bot_id=%s and server_id=%s
         """,(bot_id,sid)).fetchone()
-    return normalize_bot_permissions(row[0]) if row else set()
+
+    if not row:
+        return set()
+
+    raw=set(row[0] or [])
+    perms=normalize_bot_permissions(raw)
+
+    # Compatibility for existing installs that only stored Administrator.
+    if "administrator" in raw:
+        perms |= set(BOT_ADMIN_PERMISSIONS)
+
+    return perms
 
 
 def client_ip():
@@ -2743,6 +2754,27 @@ body.theme-light .replyBar{
   background:rgba(168,85,247,.055);
 }
 
+
+/* ============================================================
+   VYNTRA MEMBER ROLES + BOT MEMBERS + MOBILE HOLD
+   ============================================================ */
+.botMemberAvatar{
+  box-shadow:0 0 0 2px rgba(168,85,247,.28);
+}
+.profileRoleSection{
+  margin-top:12px;
+}
+.profileRoleBadges{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  margin-top:6px;
+}
+.mobileHoldTarget{
+  -webkit-touch-callout:none;
+  user-select:none;
+}
+
 </style>
 </head>
 <body>
@@ -3419,6 +3451,130 @@ async function copyMessage(mid){
  closeContext();
 }
 
+
+let _holdTimer=null;
+let _holdStartX=0;
+let _holdStartY=0;
+
+function clearMobileHold(){
+ if(_holdTimer){
+   clearTimeout(_holdTimer);
+   _holdTimer=null;
+ }
+}
+
+function attachMobileHoldMenus(){
+ if(window.innerWidth>720)return;
+
+ document.querySelectorAll(".msg").forEach(el=>{
+   if(el.dataset.holdAttached==="1")return;
+   el.dataset.holdAttached="1";
+
+   el.addEventListener("touchstart",ev=>{
+     if(ev.touches.length!==1)return;
+
+     const touch=ev.touches[0];
+     _holdStartX=touch.clientX;
+     _holdStartY=touch.clientY;
+
+     const id=Number((el.id||"").replace("message-",""));
+     if(!id)return;
+
+     clearMobileHold();
+
+     _holdTimer=setTimeout(()=>{
+       _holdTimer=null;
+
+       const fakeEvent={
+         preventDefault(){},
+         stopPropagation(){},
+         clientX:_holdStartX,
+         clientY:_holdStartY
+       };
+
+       messageMenu(fakeEvent,id);
+
+       if(navigator.vibrate){
+         navigator.vibrate(25);
+       }
+     },520);
+   },{passive:true});
+
+   el.addEventListener("touchmove",ev=>{
+     if(!_holdTimer||!ev.touches.length)return;
+
+     const touch=ev.touches[0];
+
+     if(
+       Math.abs(touch.clientX-_holdStartX)>12 ||
+       Math.abs(touch.clientY-_holdStartY)>12
+     ){
+       clearMobileHold();
+     }
+   },{passive:true});
+
+   el.addEventListener("touchend",clearMobileHold,{passive:true});
+   el.addEventListener("touchcancel",clearMobileHold,{passive:true});
+ });
+
+ document.querySelectorAll(".memberRow").forEach(el=>{
+   if(el.dataset.holdAttached==="1")return;
+   el.dataset.holdAttached="1";
+
+   el.addEventListener("touchstart",ev=>{
+     if(ev.touches.length!==1)return;
+
+     const touch=ev.touches[0];
+     _holdStartX=touch.clientX;
+     _holdStartY=touch.clientY;
+
+     const id=Number(el.dataset.memberId);
+     const isBot=el.dataset.isBot==="1";
+
+     if(!id)return;
+
+     clearMobileHold();
+
+     _holdTimer=setTimeout(()=>{
+       _holdTimer=null;
+
+       const fakeEvent={
+         preventDefault(){},
+         stopPropagation(){},
+         clientX:_holdStartX,
+         clientY:_holdStartY
+       };
+
+       if(isBot){
+         serverBotMemberMenu(fakeEvent,id);
+       }else{
+         serverMemberMenu(fakeEvent,id);
+       }
+
+       if(navigator.vibrate){
+         navigator.vibrate(25);
+       }
+     },520);
+   },{passive:true});
+
+   el.addEventListener("touchmove",ev=>{
+     if(!_holdTimer||!ev.touches.length)return;
+
+     const touch=ev.touches[0];
+
+     if(
+       Math.abs(touch.clientX-_holdStartX)>12 ||
+       Math.abs(touch.clientY-_holdStartY)>12
+     ){
+       clearMobileHold();
+     }
+   },{passive:true});
+
+   el.addEventListener("touchend",clearMobileHold,{passive:true});
+   el.addEventListener("touchcancel",clearMobileHold,{passive:true});
+ });
+}
+
 function messageMenu(ev,id){
  ev.preventDefault();ev.stopPropagation();
  const m=state.messages.find(x=>x.id===id);if(!m)return;
@@ -3444,7 +3600,8 @@ async function saveEditedMessage(e,id){e.preventDefault();try{await api("/api/me
 
 async function viewProfile(uid){
  try{
-   const d=await api("/api/profile/"+uid);
+   const profileUrl="/api/profile/"+uid+(state.view==="server"&&state.activeServer?`?server_id=${state.activeServer}`:"");
+   const d=await api(profileUrl);
    const p=d.profile;
 
    modalOpen(
@@ -3471,6 +3628,7 @@ async function viewProfile(uid){
 
      <div class="card" style="margin-top:14px">
        <div class="listSub">Vyntra ID: #${p.id}</div>
+       ${p.server_role?`<div class="profileRoleSection"><div class="label">Server Roles</div><div class="profileRoleBadges"><span class="pill">${esc(p.server_role)}</span>${(p.server_roles||[]).map(r=>`<span class="pill">${esc(r.name)}</span>`).join("")}</div></div>`:""}
        <div class="muted" style="margin-top:8px">${esc(p.pronouns||"No pronouns set")}</div>
        <p>${esc(p.description||"No description.")}</p>
        <div class="muted">${esc(p.company||"")}</div>
@@ -3601,6 +3759,13 @@ async function openServer(id,ch=null){
      state.channel=state.serverChannels[0]?.id||null;
    }
 
+   if(state.channel){
+     state.serverMembers=(state.serverMembers||[]).filter(m=>
+       !Array.isArray(m.visible_channel_ids) ||
+       m.visible_channel_ids.includes(Number(state.channel))
+     );
+   }
+
    state.lastMessageSignature="";
    renderApp();
 
@@ -3621,8 +3786,9 @@ function showMobileServerActions(){
  </div>`);
 }
 function showMobileMembers(){
- const rows=state.serverMembers.map(m=>`<div class="listItem"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)}</div><div class="listSub">${m.online?"Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}</div></div><button class="ghost" onclick="viewProfile(${m.id})">Profile</button></div>`).join("");
+ const rows=(state.serverMembers||[]).map(m=>`<div class="listItem memberRow mobileHoldTarget" data-member-id="${m.is_bot?m.bot_id:m.id}" data-is-bot="${m.is_bot?1:0}"><img class="avatar" src="${avatarSrc(m.avatar)}"><div class="listMain"><div class="listTitle">${esc(m.username)} ${m.is_bot?`<span class="roleTag">BOT</span>`:""}</div><div class="listSub">${m.is_bot?(m.role==="admin"?"Administrator Bot":"Bot"):`${m.online?"Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)}${(m.custom_roles||[]).length?` · ${(m.custom_roles||[]).map(r=>esc(r.name)).join(", ")}`:""} · ${m.device_type==="Mobile"?"Mobile":"PC"}${m.muted?" · restricted":""}${m.banned?" · banned":""}`}</div></div>${m.is_bot?`<button class="ghost" onclick="viewBotServerInfo(${m.bot_id})">Bot</button>`:`<button class="ghost" onclick="viewProfile(${m.id})">Profile</button>`}</div>`).join("");
  modalOpen(`Members · ${state.serverMembers.length}`,rows||`<div class="muted">No members.</div>`);
+ setTimeout(attachMobileHoldMenus,30);
 }
 
 function renderServer(){
@@ -3654,7 +3820,7 @@ async function refreshActiveServerMembers(){
 
  const sid=state.activeServer;
  try{
-   const d=await api(`/api/servers/${sid}/members`);
+   const d=await api(`/api/servers/${sid}/members?channel_id=${encodeURIComponent(state.channel||"")}`);
 
    if(state.view!=="server"||state.activeServer!==sid)return;
 
@@ -3666,20 +3832,152 @@ async function refreshActiveServerMembers(){
 
 function renderMembers(){
  const p=document.getElementById("membersPane");if(!p)return;
- p.innerHTML=`<div class="memberHead">Members · ${state.serverMembers.length}</div><div style="padding-top:8px">${state.serverMembers.map(m=>`<div class="memberRow" ${["owner","admin","moderator"].includes(state.serverInfo.my_role)?`oncontextmenu="serverMemberMenu(event,${m.id})"`:""}><img class="avatar" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'"><div class="memberInfo"><div class="memberName">${esc(m.username)}</div><div class="memberRole">${m.online?"● Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}</div></div></div>`).join("")}</div>`;
+
+ const list=(state.serverMembers||[]).filter(m=>
+   !Array.isArray(m.visible_channel_ids) ||
+   m.visible_channel_ids.includes(Number(state.channel))
+ );
+
+ p.innerHTML=`<div class="memberHead">Members · ${list.length}</div><div style="padding-top:8px">${list.map(m=>`
+   <div class="memberRow mobileHoldTarget"
+     data-member-id="${m.id}"
+     data-is-bot="${m.is_bot?1:0}"
+     oncontextmenu="${m.is_bot?`serverBotMemberMenu(event,${m.bot_id})`:`serverMemberMenu(event,${m.id})`}">
+     <img class="avatar ${m.is_bot?"botMemberAvatar":""}" src="${avatarSrc(m.avatar)}" onerror="this.style.visibility='hidden'">
+     <div class="memberInfo">
+       <div class="memberName">${esc(m.username)} ${m.is_bot?`<span class="roleTag">BOT</span>`:""}</div>
+       <div class="memberRole">
+         ${m.is_bot
+           ?`${m.role==="admin"?"Administrator Bot":"Bot"}`
+           :`${m.online?"● Online":relativeLastSeen(m.last_seen)} · ${esc(m.role)}${(m.custom_roles||[]).length?` · ${(m.custom_roles||[]).map(r=>esc(r.name)).join(", ")}`:""} · ${m.device_type==="Mobile"?"📱":"🖥"}${m.muted?" · muted":""}${m.banned?" · banned":""}`
+         }
+       </div>
+     </div>
+   </div>`).join("")}</div>`;
+
+ attachMobileHoldMenus();
 }
 function toggleMembers(){appShell.classList.toggle("with-members")}
 function serverMemberMenu(ev,uid){
  ev.preventDefault();ev.stopPropagation();
- const m=state.serverMembers.find(x=>x.id===uid);if(!m)return;
- const my=state.serverInfo.my_role;const canRole=my==="owner"&&m.role!=="owner";const canMute=["owner","admin","moderator"].includes(my)&&m.role!=="owner";const canBan=["owner","admin"].includes(my)&&m.role!=="owner";
- overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-220)}px;top:${Math.min(ev.clientY,innerHeight-290)}px" onclick="event.stopPropagation()">
+
+ const m=(state.serverMembers||[]).find(x=>!x.is_bot&&Number(x.id)===Number(uid));
+ if(!m)return;
+
+ const my=state.serverInfo.my_role;
+ const canBuiltIn=my==="owner"&&m.role!=="owner";
+ const canRoles=hasServerPerm("manage_roles")&&m.role!=="owner";
+ const canMute=(hasServerPerm("mute_members")||["owner","admin","moderator"].includes(my))&&m.role!=="owner";
+ const canBan=(hasServerPerm("ban_members")||["owner","admin"].includes(my))&&m.role!=="owner";
+
+ overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-230)}px;top:${Math.min(ev.clientY,innerHeight-330)}px" onclick="event.stopPropagation()">
  <button onclick="viewProfile(${uid});closeContext()">👤 View profile</button>
+ ${canRoles?`<button onclick="manageMemberCustomRoles(${state.activeServer},${uid});closeContext()">🏷 Add / Remove Roles</button>`:""}
  ${canMute?`<button onclick="serverAction(${uid},'${m.muted?"unmute":"mute"}');closeContext()">🔇 ${m.muted?"Unrestrict":"Restrict from talking"}</button>`:""}
  ${canBan?`<button class="red" onclick="serverAction(${uid},'${m.banned?"unban":"ban"}');closeContext()">⛔ ${m.banned?"Unban":"Ban from server"}</button>`:""}
- ${canRole?`<button onclick="changeServerRole(${uid});closeContext()">🛡 Change server role</button>`:""}
+ ${canBuiltIn?`<button onclick="changeServerRole(${uid});closeContext()">🛡 Change Staff Role</button>`:""}
  </div>`;
 }
+
+function serverBotMemberMenu(ev,bid){
+ ev.preventDefault();ev.stopPropagation();
+
+ const b=(state.serverMembers||[]).find(x=>x.is_bot&&Number(x.bot_id)===Number(bid));
+ if(!b)return;
+
+ const canEdit=["admin","owner"].includes(state.serverInfo?.my_role) || hasServerPerm("administrator");
+
+ overlay.innerHTML=`<div class="context" style="left:${Math.min(ev.clientX,innerWidth-235)}px;top:${Math.min(ev.clientY,innerHeight-260)}px" onclick="event.stopPropagation()">
+   <button onclick="viewBotServerInfo(${bid});closeContext()">🤖 View Bot</button>
+   ${canEdit?`<button onclick="editInstalledBotPermissions(${bid});closeContext()">⚙ Edit Permissions</button>`:""}
+   ${canEdit?`<button class="red" onclick="removeServerBot(${state.activeServer},${bid});closeContext()">🗑 Remove Bot</button>`:""}
+ </div>`;
+}
+
+function viewBotServerInfo(bid){
+ const b=(state.serverMembers||[]).find(x=>x.is_bot&&Number(x.bot_id)===Number(bid));
+ if(!b)return;
+
+ modalOpen("Bot Profile",`
+   <div class="row">
+     <img class="avatar" style="width:72px;height:72px" src="${avatarSrc(b.avatar)}">
+     <div>
+       <h2 style="margin:0">${esc(b.username)} <span class="roleTag">BOT</span></h2>
+       <div class="muted">${b.role==="admin"?"Administrator Bot":"Vyntra Bot"}</div>
+     </div>
+   </div>
+   <div class="card" style="margin-top:14px">
+     <h3>Server Permissions</h3>
+     <div class="botPermSummary">${(b.bot_permissions||[]).map(p=>`<span class="pill">${esc(BOT_PERMISSION_LABELS[p]?.[0]||p)}</span>`).join("")||'<span class="muted">No permissions.</span>'}</div>
+   </div>`);
+}
+
+async function editInstalledBotPermissions(bid){
+ try{
+   const d=await api(`/api/servers/${state.activeServer}/bots/${bid}/permissions`);
+   const selected=d.bot.permissions||[];
+
+   modalOpen("Edit Bot Permissions",`
+     <div class="row">
+       <img class="avatar" src="${avatarSrc(d.bot.avatar)}">
+       <div>
+         <div class="listTitle">${esc(d.bot.name)} <span class="roleTag">BOT</span></div>
+         <div class="listSub">Permissions apply only in this server.</div>
+       </div>
+     </div>
+     <div class="card" style="margin-top:12px">
+       ${botInstallPermissionChecks(selected)}
+     </div>
+     <div class="modalActions">
+       <button class="ghost" onclick="modalClose()">Cancel</button>
+       <button class="primary" onclick="saveInstalledBotPermissions(${bid})">Save Permissions</button>
+     </div>`);
+ }catch(e){toast(e.message)}
+}
+
+function botInstallPermissionChecks(selected=[]){
+ const have=new Set(selected||[]);
+
+ return Object.entries(BOT_PERMISSION_LABELS).map(([key,[name,desc]])=>`
+   <label class="listItem botPermissionRow ${key==="administrator"?"botAdminPermission":""}" style="cursor:pointer">
+     <input type="checkbox" data-installbotperm="${key}" ${have.has(key)?"checked":""} onchange="installedBotAdminChanged(this)">
+     <div class="listMain">
+       <div class="listTitle">${name}${key==="administrator"?` <span class="roleTag">ADMIN ROLE</span>`:""}</div>
+       <div class="listSub">${desc}</div>
+     </div>
+   </label>`).join("");
+}
+
+function installedBotAdminChanged(el){
+ if(el.dataset.installbotperm!=="administrator")return;
+
+ document.querySelectorAll("[data-installbotperm]").forEach(box=>{
+   if(box!==el){
+     box.checked=el.checked;
+     box.disabled=el.checked;
+   }
+ });
+}
+
+async function saveInstalledBotPermissions(bid){
+ const checked=[...document.querySelectorAll("[data-installbotperm]:checked")].map(x=>x.dataset.installbotperm);
+ const perms=checked.includes("administrator")?["administrator"]:checked;
+
+ try{
+   await api(`/api/servers/${state.activeServer}/bots/${bid}`,{
+     method:"PATCH",
+     body:JSON.stringify({permissions:perms})
+   });
+
+   modalClose();
+   toast("Bot permissions updated");
+   await openServer(state.activeServer,state.channel);
+
+ }catch(e){
+   toast(e.message);
+ }
+}
+
 async function serverAction(uid,action){try{await api("/api/server/member-action",{method:"POST",body:JSON.stringify({server_id:state.activeServer,user_id:uid,action,minutes:60})});await openServer(state.activeServer,state.channel);toast("Member updated")}catch(e){toast(e.message)}}
 function changeServerRole(uid){modalOpen("Change server role",`<form class="formGrid" onsubmit="saveServerRole(event,${uid})"><select id="serverRoleSelect" class="field"><option value="member">Member</option><option value="moderator">Moderator</option><option value="admin">Admin</option></select><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Save</button></div></form>`)}
 async function saveServerRole(e,uid){e.preventDefault();try{await api("/api/server/member-action",{method:"POST",body:JSON.stringify({server_id:state.activeServer,user_id:uid,action:"role",role:serverRoleSelect.value})});modalClose();await openServer(state.activeServer,state.channel)}catch(e){toast(e.message)}}
@@ -3875,7 +4173,36 @@ async function saveEditedCustomRole(e,sid,rid){
 }
 async function deleteCustomRole(sid,rid){if(!confirm("Delete this custom role?"))return;try{await api(`/api/servers/${sid}/roles/${rid}`,{method:"DELETE"});state.serverRoles=(await api(`/api/servers/${sid}/roles`)).roles;modalClose();showServerSettings(sid)}catch(e){toast(e.message)}}
 async function manageMemberCustomRoles(sid,uid){try{const username=(state.serverMembers.find(x=>Number(x.id)===Number(uid))?.username||"Member");const d=await api(`/api/servers/${sid}/members/${uid}/custom-roles`);modalOpen("Roles for "+username,`<div class="formGrid">${state.serverRoles.length?state.serverRoles.map(r=>`<label class="row"><input type="checkbox" ${d.role_ids.includes(r.id)?"checked":""} onchange="toggleMemberCustomRole(${sid},${uid},${r.id},this.checked)"> ${esc(r.name)}</label>`).join(""):'<div class="muted">Create custom roles first.</div>'}</div>`)}catch(e){toast(e.message)}}
-async function toggleMemberCustomRole(sid,uid,rid,enabled){try{await api(`/api/servers/${sid}/members/${uid}/custom-role`,{method:"POST",body:JSON.stringify({role_id:rid,enabled})});toast("Role assignment updated")}catch(e){toast(e.message)}}
+async function toggleMemberCustomRole(sid,uid,rid,enabled){
+ try{
+   await api(`/api/servers/${sid}/members/${uid}/custom-role`,{
+     method:"POST",
+     body:JSON.stringify({role_id:rid,enabled})
+   });
+
+   const member=(state.serverMembers||[]).find(x=>!x.is_bot&&Number(x.id)===Number(uid));
+   const role=(state.serverRoles||[]).find(x=>Number(x.id)===Number(rid));
+
+   if(member&&role){
+     member.custom_roles=member.custom_roles||[];
+
+     if(enabled&&!member.custom_roles.some(x=>Number(x.id)===Number(rid))){
+       member.custom_roles.push({id:role.id,name:role.name});
+     }
+
+     if(!enabled){
+       member.custom_roles=member.custom_roles.filter(x=>Number(x.id)!==Number(rid));
+     }
+
+     renderMembers();
+   }
+
+   toast(enabled?"Role added":"Role removed");
+
+ }catch(e){
+   toast(e.message);
+ }
+}
 
 async function showVyntraHooks(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`);modalOpen("VyntraHooks",`<div class="muted">A VyntraHook is a secret incoming link that can post messages into this channel. Never share a hook URL publicly.</div><div class="card" style="margin-top:12px"><div class="searchBox"><input id="hookName" class="field" placeholder="Hook name" value="VyntraHook"><button class="primary" onclick="createVyntraHook(${cid})">Create</button></div></div><div>${d.hooks.length?d.hooks.map(h=>`<div class="listItem"><div class="listMain"><div class="listTitle">${esc(h.name)}</div><div class="listSub">Created ${new Date(h.created_at).toLocaleString()}</div></div><button class="danger" onclick="deleteVyntraHook(${cid},${h.id})">Delete</button></div>`).join(""):'<div class="muted">No hooks for this channel.</div>'}</div>`)}catch(e){toast(e.message)}}
 async function createVyntraHook(cid){try{const d=await api(`/api/servers/${state.activeServer}/channels/${cid}/spookhooks`,{method:"POST",body:JSON.stringify({name:hookName.value})});modalOpen("VyntraHook created",`<div class="card"><div class="muted">Copy this URL now. For security, VYNTRA will not show this secret URL again.</div><input id="newHookUrl" class="field" value="${esc(d.url)}" readonly style="margin-top:10px"><button class="primary" style="margin-top:10px" onclick="navigator.clipboard.writeText(newHookUrl.value);toast('Copied')">Copy URL</button></div><div class="card"><div class="label">Example JSON POST body</div><pre style="white-space:pre-wrap">{"content":"Hello from my app","username":"My Bot"}</pre></div>`)}catch(e){toast(e.message)}}
@@ -4085,7 +4412,7 @@ async function loadOwnerAudit(){
 
 
 const BOT_PERMISSION_LABELS={
- administrator:["Administrator","Gives the bot every VYNTRA server-level bot permission. Does not grant website Owner/Admin access and cannot delete servers or access private website internals."],
+ administrator:["Administrator","Installs the bot with the server Admin role and every VYNTRA bot server permission. It still cannot access website Owner controls, private account data, delete servers, or transfer ownership."],
  view_channels:["View Channels","Allows the bot to see the server channel list."],
  read_messages:["Read Message History","Allows the bot API to read recent channel messages."],
  send_messages:["Send Messages","Allows the bot to send messages into server channels."],
@@ -5296,6 +5623,39 @@ def profile_get(uid):
     presence=presence_payload(u["last_seen"])
     profile["online"]=presence["online"]
     profile["last_seen"]=presence["last_seen"]
+    profile["server_role"]=None
+    profile["server_roles"]=[]
+
+    sid=request.args.get("server_id")
+    if sid:
+        try:
+            sid=int(sid)
+        except Exception:
+            sid=None
+
+    if sid and server_member(sid,request.me["id"]):
+        with connect() as c:
+            builtin=c.execute("""
+                select role
+                from server_members
+                where server_id=%s and user_id=%s
+            """,(sid,uid)).fetchone()
+
+            roles=c.execute("""
+                select sr.id,sr.name
+                from server_member_roles smr
+                join server_roles sr on sr.id=smr.role_id
+                where smr.server_id=%s and smr.user_id=%s
+                order by lower(sr.name),sr.id
+            """,(sid,uid)).fetchall()
+
+        if builtin:
+            profile["server_role"]=builtin[0]
+
+        profile["server_roles"]=[
+            {"id":r[0],"name":r[1]}
+            for r in roles
+        ]
 
     return jsonify(profile=profile)
 
@@ -5757,7 +6117,13 @@ def bot_install(public_id):
         if not bot:
             return jsonify(error="Bot invite not found"),404
 
-        perms=sorted(normalize_bot_permissions(bot[1] or []))
+        requested=set(bot[1] or [])
+        perms=sorted(normalize_bot_permissions(requested))
+
+        # Keep Administrator explicitly stored so the UI can show that this
+        # bot was installed as a server admin bot.
+        if "administrator" in requested and "administrator" not in perms:
+            perms.insert(0,"administrator")
 
         c.execute("""
             insert into bot_server_installs(
@@ -5774,6 +6140,66 @@ def bot_install(public_id):
 
     return jsonify(ok=True,server_id=sid)
 
+
+
+@app.get("/api/servers/<int:sid>/bots/<int:bid>/permissions")
+@login_required
+def server_bot_permissions_get(sid,bid):
+    if not server_member(sid,request.me["id"]):
+        return jsonify(error="Not a server member"),403
+
+    with connect() as c:
+        row=c.execute("""
+            select b.id,b.name,b.avatar,bi.permissions
+            from bot_server_installs bi
+            join vyntra_bots b on b.id=bi.bot_id
+            where bi.server_id=%s and bi.bot_id=%s
+        """,(sid,bid)).fetchone()
+
+    if not row:
+        return jsonify(error="Bot is not installed in this server"),404
+
+    return jsonify(
+        bot={
+            "id":row[0],
+            "name":row[1],
+            "avatar":row[2],
+            "permissions":list(row[3] or [])
+        },
+        permission_keys=BOT_PERMISSION_KEYS
+    )
+
+
+@app.patch("/api/servers/<int:sid>/bots/<int:bid>")
+@login_required
+def server_bot_permissions_edit(sid,bid):
+    if not can_install_bot_to_server(sid,request.me["id"]):
+        return jsonify(error="You need server Admin permissions to edit bot permissions."),403
+
+    d=request.get_json(silent=True) or {}
+    requested=set(d.get("permissions") or [])
+    perms=sorted(normalize_bot_permissions(requested))
+
+    if "administrator" in requested and "administrator" not in perms:
+        perms.insert(0,"administrator")
+
+    with connect() as c:
+        exists=c.execute("""
+            select 1 from bot_server_installs
+            where bot_id=%s and server_id=%s
+        """,(bid,sid)).fetchone()
+
+        if not exists:
+            return jsonify(error="Bot is not installed in this server"),404
+
+        c.execute("""
+            update bot_server_installs
+            set permissions=%s
+            where bot_id=%s and server_id=%s
+        """,(psycopg.types.json.Jsonb(perms),bid,sid))
+        c.commit()
+
+    return jsonify(ok=True,permissions=perms)
 
 @app.delete("/api/servers/<int:sid>/bots/<int:bid>")
 @login_required
@@ -5981,6 +6407,22 @@ def server_bootstrap(sid):
             order by id
         """,(sid,)).fetchall()
 
+        all_member_role_rows=c.execute("""
+            select smr.user_id,sr.id,sr.name,sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s
+            order by smr.user_id,sr.id
+        """,(sid,)).fetchall()
+
+        bot_rows=c.execute("""
+            select b.id,b.public_id,b.name,b.avatar,bi.permissions
+            from bot_server_installs bi
+            join vyntra_bots b on b.id=bi.bot_id
+            where bi.server_id=%s
+            order by lower(b.name)
+        """,(sid,)).fetchall()
+
         custom_for_viewer=c.execute("""
             select sr.id,sr.permissions
             from server_member_roles smr
@@ -6045,19 +6487,103 @@ def server_bootstrap(sid):
                 "can_send":sm_role=="owner" or "send_messages" in perms
             })
 
+    member_custom={}
+    for user_id,role_id,role_name,raw_perms in all_member_role_rows:
+        member_custom.setdefault(user_id,[]).append({
+            "id":role_id,
+            "name":role_name,
+            "permissions":raw_perms or {}
+        })
+
+    all_overrides={}
+    for cid,role_key,allow,deny in override_rows:
+        slot=all_overrides.setdefault(cid,{})
+        slot[role_key]={
+            "allow":set(allow or []),
+            "deny":set(deny or [])
+        }
+
     members=[]
+
     for r in member_rows:
+        uid=r[0]
+        builtin=r[3]
+        custom_roles=member_custom.get(uid,[])
+
+        if builtin=="owner":
+            base_perms=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)|{"delete_server"}
+        else:
+            base_perms=set(BUILTIN_SERVER_PERMISSIONS.get(builtin,set()))
+            for cr in custom_roles:
+                rp=normalize_permissions(cr["permissions"])
+                if "administrator" in rp:
+                    base_perms|=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)
+                base_perms|=(rp-{"administrator"})
+
+        role_keys={builtin}|{f"custom:{cr['id']}" for cr in custom_roles}
+        visible=[]
+
+        for cid,_,_,_ in channel_rows:
+            effective=set(base_perms)
+            by_role=all_overrides.get(cid,{})
+            allow=set()
+            deny=set()
+
+            for key in role_keys:
+                ov=by_role.get(key)
+                if ov:
+                    allow|=ov["allow"]
+                    deny|=ov["deny"]
+
+            effective-=deny
+            effective|=allow
+
+            if builtin=="owner" or "view_channels" in effective:
+                visible.append(cid)
+
         p=presence_payload(r[7])
+
         members.append({
-            "id":r[0],
+            "id":uid,
             "username":r[1],
             "avatar":r[2],
-            "role":r[3],
+            "role":builtin,
+            "custom_roles":[{"id":cr["id"],"name":cr["name"]} for cr in custom_roles],
             "muted":bool(r[4] and r[4]>now),
             "banned":bool(r[5] and r[5]>now),
             "device_type":r[6],
             "online":p["online"],
-            "last_seen":p["last_seen"]
+            "last_seen":p["last_seen"],
+            "visible_channel_ids":visible,
+            "is_bot":False
+        })
+
+    for bid,public_id,name,avatar,raw_perms in bot_rows:
+        stored=set(raw_perms or [])
+        effective=bot_install_permissions(bid,sid)
+        bot_admin="administrator" in stored
+
+        visible=[
+            cid for cid,_,_,_ in channel_rows
+            if "view_channels" in effective
+        ]
+
+        members.append({
+            "id":bid,
+            "bot_id":bid,
+            "public_id":public_id,
+            "username":name,
+            "avatar":avatar,
+            "role":"admin" if bot_admin else "bot",
+            "custom_roles":[],
+            "bot_permissions":list(raw_perms or []),
+            "muted":False,
+            "banned":False,
+            "device_type":"Bot",
+            "online":True,
+            "last_seen":None,
+            "visible_channel_ids":visible,
+            "is_bot":True
         })
 
     return jsonify(
@@ -6126,37 +6652,143 @@ def server_delete(sid):
 @app.get("/api/servers/<int:sid>/members")
 @login_required
 def server_members_get(sid):
-    sm=server_member(sid,request.me["id"])
-    if not sm:return jsonify(error="Not a server member"),403
+    viewer=server_member(sid,request.me["id"])
+    if not viewer:
+        return jsonify(error="Not a server member"),403
+
+    channel_id=request.args.get("channel_id")
+    try:
+        channel_id=int(channel_id) if channel_id else None
+    except Exception:
+        channel_id=None
+
     with connect() as c:
         rows=c.execute("""
             select u.id,u.username,u.avatar,sm.role,sm.muted_until,sm.banned_until,
                    u.device_type,u.last_seen
-            from server_members sm join users u on u.id=sm.user_id
-            where sm.server_id=%s order by
-            case sm.role when 'owner' then 3 when 'admin' then 2 when 'moderator' then 1 else 0 end desc,
-            u.username
+            from server_members sm
+            join users u on u.id=sm.user_id
+            where sm.server_id=%s
+            order by
+              case sm.role when 'owner' then 3 when 'admin' then 2 when 'moderator' then 1 else 0 end desc,
+              lower(u.username)
         """,(sid,)).fetchall()
+
+        custom_rows=c.execute("""
+            select smr.user_id,sr.id,sr.name,sr.permissions
+            from server_member_roles smr
+            join server_roles sr on sr.id=smr.role_id
+            where smr.server_id=%s
+        """,(sid,)).fetchall()
+
+        bot_rows=c.execute("""
+            select b.id,b.public_id,b.name,b.avatar,bi.permissions
+            from bot_server_installs bi
+            join vyntra_bots b on b.id=bi.bot_id
+            where bi.server_id=%s
+            order by lower(b.name)
+        """,(sid,)).fetchall()
+
+        override_rows=[]
+        if channel_id:
+            override_rows=c.execute("""
+                select role_key,allow_permissions,deny_permissions
+                from channel_role_overrides
+                where channel_id=%s
+            """,(channel_id,)).fetchall()
+
+    custom_by_user={}
+    for uid,rid,rname,rperms in custom_rows:
+        custom_by_user.setdefault(uid,[]).append({
+            "id":rid,
+            "name":rname,
+            "permissions":rperms or {}
+        })
+
+    overrides={
+        role_key:{
+            "allow":set(allow or []),
+            "deny":set(deny or [])
+        }
+        for role_key,allow,deny in override_rows
+    }
 
     now=datetime.now(timezone.utc)
     members=[]
 
     for r in rows:
+        uid=r[0]
+        builtin=r[3]
+        custom=custom_by_user.get(uid,[])
+
+        if channel_id:
+            if builtin=="owner":
+                effective=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)|{"delete_server"}
+            else:
+                effective=set(BUILTIN_SERVER_PERMISSIONS.get(builtin,set()))
+                for cr in custom:
+                    rp=normalize_permissions(cr["permissions"])
+                    if "administrator" in rp:
+                        effective|=set(ALL_SERVER_PERMISSIONS_EXCEPT_DELETE)
+                    effective|=(rp-{"administrator"})
+
+            keys={builtin}|{f"custom:{cr['id']}" for cr in custom}
+            allow=set()
+            deny=set()
+
+            for key in keys:
+                ov=overrides.get(key)
+                if ov:
+                    allow|=ov["allow"]
+                    deny|=ov["deny"]
+
+            effective-=deny
+            effective|=allow
+
+            if builtin!="owner" and "view_channels" not in effective:
+                continue
+
         presence=presence_payload(r[7])
+
         members.append({
-            "id":r[0],
+            "id":uid,
             "username":r[1],
             "avatar":r[2],
-            "role":r[3],
+            "role":builtin,
+            "custom_roles":[{"id":x["id"],"name":x["name"]} for x in custom],
             "muted":bool(r[4] and r[4]>now),
             "banned":bool(r[5] and r[5]>now),
             "device_type":r[6],
             "online":presence["online"],
-            "last_seen":presence["last_seen"]
+            "last_seen":presence["last_seen"],
+            "is_bot":False
+        })
+
+    for bid,public_id,name,avatar,raw_perms in bot_rows:
+        stored=set(raw_perms or [])
+        effective=bot_install_permissions(bid,sid)
+
+        if channel_id and "view_channels" not in effective:
+            continue
+
+        members.append({
+            "id":bid,
+            "bot_id":bid,
+            "public_id":public_id,
+            "username":name,
+            "avatar":avatar,
+            "role":"admin" if "administrator" in stored else "bot",
+            "custom_roles":[],
+            "bot_permissions":list(raw_perms or []),
+            "muted":False,
+            "banned":False,
+            "device_type":"Bot",
+            "online":True,
+            "last_seen":None,
+            "is_bot":True
         })
 
     return jsonify(members=members)
-
 @app.post("/api/servers/<int:sid>/members")
 @login_required
 def server_member_add(sid):
