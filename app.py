@@ -3592,6 +3592,38 @@ body.iphone11PreviewMode{
   font-weight:800;
 }
 
+
+/* ============================================================
+   VYNTRA CALL PERMISSION PROMPT + LARGE BUTTON
+   ============================================================ */
+.callTopBtn{
+  min-width:100px!important;
+  height:44px!important;
+  padding:0 18px!important;
+  border-radius:13px!important;
+  border:1px solid rgba(168,85,247,.30)!important;
+  background:rgba(168,85,247,.14)!important;
+  color:#e3c8ff!important;
+  display:inline-flex!important;
+  align-items:center!important;
+  justify-content:center!important;
+  gap:8px!important;
+  font-size:13px!important;
+  font-weight:900!important;
+  cursor:pointer!important;
+}
+.callTopBtn:hover{background:rgba(168,85,247,.22)!important;transform:translateY(-1px)}
+.callTopBtn.inCall{background:rgba(74,222,128,.11)!important;border-color:rgba(74,222,128,.28)!important;color:#adf3c4!important}
+.callTopIcon{font-size:17px}
+.callPermissionWarning{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 12px;border:1px solid rgba(251,191,36,.20);background:rgba(251,191,36,.06);border-radius:13px}
+.callPermissionWarning>div{display:flex;flex-direction:column;gap:3px}
+.callPermissionWarning b{color:#f5d78b;font-size:12px}
+.callPermissionWarning span{color:#aa9b87;font-size:11px;line-height:1.4}
+@media(max-width:720px){
+ .callTopBtn{min-width:88px!important;height:40px!important;padding:0 14px!important}
+ .callPermissionWarning{flex-direction:column;align-items:stretch}
+}
+
 </style>
 </head>
 <body>
@@ -3609,7 +3641,7 @@ const state={
  messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
  pendingImage:null,unreads:{public:{},dms:{},servers:{},server_totals:{},friends_total:0,total:0},
  unreadPoll:null,notificationPermission:"default",lastNotified:{},
- call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:""}
+ call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:"",micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:""}
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -4508,28 +4540,69 @@ function currentCallScopePayload(){
  return null;
 }
 function callButton(){
- return `<button class="roundBtn callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"startCall()"}" title="${state.call.active?"Open call":"Start call"}">${state.call.active?"☎":"♬"}</button>`;
+ return `<button class="callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"startCall()"}" title="${state.call.active?"Open current call":"Start call"}"><span class="callTopIcon">☎</span><span>${state.call.active?"In Call":"Call"}</span></button>`;
 }
 async function enumerateCallDevices(){
  if(!navigator.mediaDevices?.enumerateDevices)return {mics:[],cameras:[]};
  const all=await navigator.mediaDevices.enumerateDevices();
  return {mics:all.filter(x=>x.kind==="audioinput"),cameras:all.filter(x=>x.kind==="videoinput")};
 }
-async function ensureCallAudio(){
- if(state.call.localStream)return state.call.localStream;
- const stream=await navigator.mediaDevices.getUserMedia({audio:state.call.selectedMic?{deviceId:{exact:state.call.selectedMic}}:true,video:false});
- state.call.localStream=stream; return stream;
+async function ensureCallAudio(showMessage=false){
+ if(state.call.localStream?.getAudioTracks?.().length)return state.call.localStream;
+ if(!navigator.mediaDevices?.getUserMedia){
+  state.call.micPermission="unsupported";state.call.micEnabled=false;state.call.localStream=new MediaStream();return state.call.localStream;
+ }
+ try{
+  const stream=await navigator.mediaDevices.getUserMedia({audio:state.call.selectedMic?{deviceId:{exact:state.call.selectedMic}}:true,video:false});
+  state.call.localStream=stream;state.call.micPermission="granted";state.call.micError="";state.call.micEnabled=true;return stream;
+ }catch(e){
+  state.call.localStream=new MediaStream();state.call.micEnabled=false;
+  if(e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"){
+   state.call.micPermission="denied";state.call.micError="Microphone permission is blocked.";
+   if(showMessage)toast("Microphone blocked — joining muted.");
+  }else if(e?.name==="NotFoundError"){
+   state.call.micPermission="missing";state.call.micError="No microphone was found.";
+   if(showMessage)toast("No microphone found — joining muted.");
+  }else{
+   state.call.micPermission="error";state.call.micError=e?.message||"Could not open microphone.";
+   if(showMessage)toast("Microphone unavailable — joining muted.");
+  }
+  return state.call.localStream;
+ }
+}
+
+async function requestInitialCallPermissions(){
+ if(!navigator.mediaDevices?.getUserMedia)return;
+ await ensureCallAudio(true);
+
+ try{
+  const cam=await navigator.mediaDevices.getUserMedia({audio:false,video:state.call.selectedCamera?{deviceId:{exact:state.call.selectedCamera}}:true});
+  state.call.cameraPermission="granted";state.call.cameraError="";
+  cam.getTracks().forEach(track=>track.stop());
+ }catch(e){
+  if(e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"){
+   state.call.cameraPermission="denied";state.call.cameraError="Camera permission is blocked.";toast("Camera blocked — you can still join the call.");
+  }else if(e?.name==="NotFoundError"){
+   state.call.cameraPermission="missing";state.call.cameraError="No camera was found.";
+  }else{
+   state.call.cameraPermission="error";state.call.cameraError=e?.message||"Could not open camera.";
+  }
+ }
 }
 async function startCall(){
  if(state.call.active)return openCallPanel();
- if(!navigator.mediaDevices?.getUserMedia){toast("Calling is not supported by this browser.");return}
- const scope=currentCallScopePayload(); if(!scope){toast("Open a messaging channel first.");return}
+ const scope=currentCallScopePayload();if(!scope){toast("Open a messaging channel first.");return}
  try{
-  await ensureCallAudio();
+  await requestInitialCallPermissions();
   const d=await api("/api/calls/join",{method:"POST",body:JSON.stringify(scope)});
   state.call.active=true;state.call.scopeKey=d.scope_key;state.call.participants=d.participants||[];state.call.signalAfter=0;
   await syncCallPeers();startCallPolling();await openCallPanel();
- }catch(e){toast(e.message||"Could not start call")}
+ }catch(e){
+  state.call.active=false;state.call.scopeKey="";
+  const msg=String(e?.message||"Could not start call");
+  if(msg.toLowerCase().includes("you cannot join this call"))toast("VYNTRA denied access to this call. Make sure you can view this channel or chat.");
+  else toast(msg);
+ }
 }
 function startCallPolling(){
  clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);
@@ -4549,7 +4622,7 @@ async function syncCallPeers(){
 async function createCallPeer(remoteId,makeOffer){
  const pc=new RTCPeerConnection(VYNTRA_RTC_CONFIG);const remoteStream=new MediaStream();
  state.call.peers[remoteId]={pc,stream:remoteStream};
- const audio=await ensureCallAudio();audio.getAudioTracks().forEach(track=>pc.addTrack(track,audio));
+ const audio=await ensureCallAudio(false);audio.getAudioTracks().forEach(track=>pc.addTrack(track,audio));
  if(state.call.videoStream){const vt=state.call.videoStream.getVideoTracks()[0];if(vt)pc.addTrack(vt,state.call.videoStream)}
  pc.onicecandidate=e=>{if(e.candidate)sendCallSignal(remoteId,"ice",{candidate:e.candidate.toJSON()})};
  pc.ontrack=e=>{e.streams[0]?.getTracks().forEach(track=>{if(!remoteStream.getTracks().some(t=>t.id===track.id))remoteStream.addTrack(track)});renderCallParticipants()};
@@ -4584,10 +4657,32 @@ async function leaveCall(){
  clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);Object.values(state.call.peers).forEach(p=>{try{p.pc.close()}catch(e){}});
  state.call.localStream?.getTracks().forEach(t=>t.stop());state.call.videoStream?.getTracks().forEach(t=>t.stop());
  const mic=state.call.selectedMic,cam=state.call.selectedCamera;
- state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam};
+ state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam,micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:""};
  document.querySelectorAll('[id^="callAudio-"]').forEach(e=>e.remove());modalClose();renderApp();toast("Left call");
 }
-function toggleCallMute(){state.call.micEnabled=!state.call.micEnabled;state.call.localStream?.getAudioTracks().forEach(t=>t.enabled=state.call.micEnabled);updateCallControls()}
+async function enableCallMicrophone(){
+ if(state.call.localStream?.getAudioTracks?.().length){
+  state.call.micEnabled=true;state.call.localStream.getAudioTracks().forEach(t=>t.enabled=true);updateCallControls();return;
+ }
+ state.call.localStream=null;
+ const stream=await ensureCallAudio(true);const track=stream.getAudioTracks()[0];
+ if(!track){openCallPermissionHelp("microphone");updateCallControls();return}
+ track.enabled=true;state.call.micEnabled=true;
+ for(const p of Object.values(state.call.peers)){
+  const sender=p.pc.getSenders().find(s=>s.track?.kind==="audio");
+  if(sender)await sender.replaceTrack(track);else p.pc.addTrack(track,stream);
+ }
+ updateCallControls();toast("Microphone enabled");
+}
+function openCallPermissionHelp(type){
+ const isMic=type==="microphone",title=isMic?"Microphone Permission":"Camera Permission",err=isMic?state.call.micError:state.call.cameraError;
+ modalOpen(title,`<div class="card"><h3>${title} is blocked</h3><div class="muted">${esc(err||`${title} is unavailable.`)}</div></div><div class="card"><h3>Allow access</h3><div class="muted" style="line-height:1.65">Click the site/lock icon beside the VYNTRA address, set <b>${isMic?"Microphone":"Camera"}</b> to <b>Allow</b>, then reload VYNTRA.<br><br>On Windows you may also need Settings → Privacy & security.</div></div><div class="modalActions"><button class="ghost" onclick="modalClose()">Close</button><button class="primary" onclick="modalClose();${isMic?"enableCallMicrophone()":"toggleCamera()"}">Try Again</button></div>`);
+}
+function toggleCallMute(){
+ const tracks=state.call.localStream?.getAudioTracks?.()||[];
+ if(!tracks.length){enableCallMicrophone();return}
+ state.call.micEnabled=!state.call.micEnabled;tracks.forEach(t=>t.enabled=state.call.micEnabled);updateCallControls();
+}
 async function setOutgoingVideoTrack(track,stream){
  for(const p of Object.values(state.call.peers)){
   let sender=p.pc.getSenders().find(s=>s.track?.kind==="video");
@@ -4600,7 +4695,11 @@ async function toggleCamera(){
   if(state.call.cameraEnabled){state.call.videoStream?.getTracks().forEach(t=>t.stop());await setOutgoingVideoTrack(null,null);state.call.videoStream=null;state.call.cameraEnabled=false;renderCallParticipants();updateCallControls();return}
   const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:state.call.selectedCamera?{deviceId:{exact:state.call.selectedCamera}}:true});
   state.call.videoStream=stream;state.call.cameraEnabled=true;const track=stream.getVideoTracks()[0];await setOutgoingVideoTrack(track,stream);track.onended=()=>{if(state.call.cameraEnabled)toggleCamera()};renderCallParticipants();updateCallControls();
- }catch(e){toast(e.message||"Could not use camera")}
+ }catch(e){
+  if(e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"){
+   state.call.cameraPermission="denied";state.call.cameraError="Camera permission is blocked.";openCallPermissionHelp("camera");
+  }else toast(e.message||"Could not use camera");
+ }
 }
 async function toggleScreenShare(){
  if(!navigator.mediaDevices?.getDisplayMedia){toast("Screen sharing is not available in this browser.");return}
@@ -4615,7 +4714,15 @@ async function stopScreenShare(){
 }
 async function changeCallMic(el){
  state.call.selectedMic=el.value;if(!state.call.active)return;
- try{const stream=await navigator.mediaDevices.getUserMedia({audio:el.value?{deviceId:{exact:el.value}}:true,video:false});const track=stream.getAudioTracks()[0];track.enabled=state.call.micEnabled;for(const p of Object.values(state.call.peers)){const s=p.pc.getSenders().find(x=>x.track?.kind==="audio");if(s)await s.replaceTrack(track)}state.call.localStream?.getAudioTracks().forEach(t=>t.stop());state.call.localStream=new MediaStream([track]);toast("Microphone changed")}catch(e){toast(e.message||"Could not change microphone")}
+ try{
+  const stream=await navigator.mediaDevices.getUserMedia({audio:el.value?{deviceId:{exact:el.value}}:true,video:false});
+  const track=stream.getAudioTracks()[0];track.enabled=true;
+  for(const p of Object.values(state.call.peers)){const s=p.pc.getSenders().find(x=>x.track?.kind==="audio");if(s)await s.replaceTrack(track);else p.pc.addTrack(track,stream)}
+  state.call.localStream?.getAudioTracks().forEach(t=>t.stop());state.call.localStream=new MediaStream([track]);state.call.micEnabled=true;state.call.micPermission="granted";state.call.micError="";updateCallControls();toast("Microphone changed");
+ }catch(e){
+  if(e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"){state.call.micPermission="denied";state.call.micError="Microphone permission is blocked.";openCallPermissionHelp("microphone")}
+  else toast(e.message||"Could not change microphone");
+ }
 }
 async function changeCallCamera(el){state.call.selectedCamera=el.value;if(state.call.cameraEnabled){await toggleCamera();await toggleCamera()}}
 async function openCallPanel(){
@@ -4624,6 +4731,7 @@ async function openCallPanel(){
  modalOpen("VYNTRA Call",`<div class="callPanel">
   <div class="callHeaderCard"><div><div class="listTitle">Connected Call</div><div class="listSub">${state.call.participants.length} participant${state.call.participants.length===1?"":"s"}</div></div><button class="danger" onclick="leaveCall()">Leave</button></div>
   <div id="callParticipants" class="callParticipants"></div>
+  ${(state.call.micPermission==="denied"||state.call.cameraPermission==="denied")?`<div class="callPermissionWarning"><div><b>Device permission blocked</b><span>${state.call.micPermission==="denied"?"Microphone ":""}${state.call.micPermission==="denied"&&state.call.cameraPermission==="denied"?"and ":""}${state.call.cameraPermission==="denied"?"camera ":""}access is blocked. You can still stay in the call.</span></div><button class="ghost" onclick="openCallPermissionHelp('${state.call.micPermission==="denied"?"microphone":"camera"}')">Fix Permission</button></div>`:""}
   <div class="callControls"><button id="callMuteBtn" class="callControlBtn" onclick="toggleCallMute()"></button><button id="callCameraBtn" class="callControlBtn" onclick="toggleCamera()"></button><button id="callScreenBtn" class="callControlBtn" onclick="toggleScreenShare()"></button></div>
   <div class="grid2 callDeviceGrid"><div><div class="label">Microphone</div><select class="field" onchange="changeCallMic(this)"><option value="">Default microphone</option>${devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedMic===d.deviceId?"selected":""}>${esc(d.label||`Microphone ${i+1}`)}</option>`).join("")}</select></div><div><div class="label">Camera</div><select class="field" onchange="changeCallCamera(this)"><option value="">Default camera</option>${devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedCamera===d.deviceId?"selected":""}>${esc(d.label||`Camera ${i+1}`)}</option>`).join("")}</select></div></div>
   <div class="callHint">Camera and microphone access require permission. Screen sharing availability depends on your phone/browser.</div>
@@ -4631,7 +4739,11 @@ async function openCallPanel(){
 }
 function updateCallControls(){
  const m=document.getElementById("callMuteBtn"),c=document.getElementById("callCameraBtn"),s=document.getElementById("callScreenBtn");
- if(m){m.textContent=state.call.micEnabled?"🎤 Mute":"🔇 Unmute";m.classList.toggle("off",!state.call.micEnabled)}
+ if(m){
+  const hasMic=!!state.call.localStream?.getAudioTracks?.().length;
+  if(!hasMic){m.textContent="🎤 Enable Mic";m.classList.add("off")}
+  else{m.textContent=state.call.micEnabled?"🎤 Mute":"🔇 Unmute";m.classList.toggle("off",!state.call.micEnabled)}
+ }
  if(c){c.textContent=state.call.cameraEnabled?"📷 Camera Off":"📷 Camera On";c.classList.toggle("active",state.call.cameraEnabled)}
  if(s){s.textContent=state.call.sharingScreen?"🖥 Stop Sharing":"🖥 Share Screen";s.classList.toggle("active",state.call.sharingScreen)}
 }
