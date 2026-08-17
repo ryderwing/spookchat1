@@ -264,6 +264,27 @@ create table if not exists messages(
 
 
 
+
+create table if not exists call_participants(
+ scope_key text not null,
+ user_id bigint not null references users(id) on delete cascade,
+ joined_at timestamptz not null default now(),
+ last_seen timestamptz not null default now(),
+ primary key(scope_key,user_id)
+);
+create index if not exists call_participants_scope_idx on call_participants(scope_key,last_seen);
+
+create table if not exists call_signals(
+ id bigserial primary key,
+ scope_key text not null,
+ from_user_id bigint not null references users(id) on delete cascade,
+ to_user_id bigint not null references users(id) on delete cascade,
+ signal_type text not null,
+ payload jsonb not null,
+ created_at timestamptz not null default now()
+);
+create index if not exists call_signals_target_idx on call_signals(scope_key,to_user_id,id);
+
 create table if not exists message_read_state(
  user_id bigint not null references users(id) on delete cascade,
  scope_key text not null,
@@ -554,6 +575,30 @@ def init_db():
             """)
             c.execute("create index if not exists message_read_state_user_idx on message_read_state(user_id,updated_at)")
 
+
+            c.execute("""
+                create table if not exists call_participants(
+                 scope_key text not null,
+                 user_id bigint not null references users(id) on delete cascade,
+                 joined_at timestamptz not null default now(),
+                 last_seen timestamptz not null default now(),
+                 primary key(scope_key,user_id)
+                )
+            """)
+            c.execute("create index if not exists call_participants_scope_idx on call_participants(scope_key,last_seen)")
+            c.execute("""
+                create table if not exists call_signals(
+                 id bigserial primary key,
+                 scope_key text not null,
+                 from_user_id bigint not null references users(id) on delete cascade,
+                 to_user_id bigint not null references users(id) on delete cascade,
+                 signal_type text not null,
+                 payload jsonb not null,
+                 created_at timestamptz not null default now()
+                )
+            """)
+            c.execute("create index if not exists call_signals_target_idx on call_signals(scope_key,to_user_id,id)")
+
             c.execute("insert into site_settings(id) values(1) on conflict(id) do nothing")
 
             c.execute("alter table site_settings add column if not exists public_channels_locked boolean not null default false")
@@ -631,6 +676,38 @@ def presence_payload(last_seen):
         "last_seen":last_seen.isoformat()
     }
 
+
+
+def call_scope_key(kind,channel=None,server_id=None,chat_id=None):
+    if kind=="public":
+        return f"public:{str(channel)}"
+    if kind=="server":
+        return f"server:{int(server_id)}:{int(channel)}"
+    if kind=="dm":
+        return f"dm:{int(chat_id)}"
+    return ""
+
+def verify_call_access(kind,uid,channel=None,server_id=None,chat_id=None):
+    if kind=="public":
+        return True
+    if kind=="server":
+        try:
+            sid=int(server_id); cid=int(channel)
+        except Exception:
+            return False
+        sm,perms=channel_effective_permissions(sid,cid,uid)
+        return bool(sm and "view_channels" in perms)
+    if kind=="dm":
+        try:
+            cid=int(chat_id)
+        except Exception:
+            return False
+        with connect() as c:
+            return bool(c.execute(
+                "select 1 from chat_members where chat_id=%s and user_id=%s",
+                (cid,uid)
+            ).fetchone())
+    return False
 
 def message_scope_key(kind,channel=None,server_id=None,chat_id=None):
     if kind=="public":
@@ -3490,6 +3567,31 @@ body.iphone11PreviewMode{
   background:#a855f7;
 }
 
+
+/* ============================================================
+   VYNTRA WEBRTC CALLS
+   ============================================================ */
+.callTopBtn{color:#c797ff}.callTopBtn.inCall{background:rgba(168,85,247,.15);box-shadow:0 0 0 1px rgba(168,85,247,.25)}
+.callPanel{display:flex;flex-direction:column;gap:14px}.callHeaderCard{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px;border-radius:14px;border:1px solid rgba(255,255,255,.07);background:#14101b}
+.callParticipants{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.callTile{overflow:hidden;border-radius:15px;border:1px solid rgba(255,255,255,.07);background:#100c16}.callVideoWrap{aspect-ratio:16/10;background:#09070d;overflow:hidden}.callVideoWrap video{width:100%;height:100%;object-fit:cover;display:block}
+.callAvatarFallback{width:100%;height:100%;display:flex;flex-direction:column;gap:8px;align-items:center;justify-content:center;color:#a99cb4;font-size:12px}.callAvatarFallback img{width:72px;height:72px;border-radius:50%;object-fit:cover}.callTileFooter{display:flex;align-items:center;gap:6px;min-height:38px;padding:8px 10px;color:#d8cfdf;font-size:12px;font-weight:800}
+.callControls{display:flex;flex-wrap:wrap;justify-content:center;gap:8px}.callControlBtn{min-height:40px;padding:0 14px;border-radius:12px;border:1px solid rgba(255,255,255,.07);background:#191220;color:#e8deef;cursor:pointer;font-weight:800}.callControlBtn.off{background:#27151b;color:#ffb6c2}.callControlBtn.active{border-color:rgba(168,85,247,.35);background:rgba(168,85,247,.14);color:#e1c7ff}.callHint{color:#8f8599;font-size:11px;line-height:1.5}
+@media(max-width:720px){.callParticipants{grid-template-columns:1fr}.callDeviceGrid{grid-template-columns:1fr!important}.callControls{display:grid;grid-template-columns:1fr 1fr}.callControls .callControlBtn:last-child{grid-column:1/-1}.callVideoWrap{aspect-ratio:4/3}.callHeaderCard{align-items:flex-start}.mobileCallQuick{color:#d4b2ff!important;border-color:rgba(168,85,247,.22)!important}}
+
+
+.profileFriendStatus{
+  display:inline-flex;
+  align-items:center;
+  margin-top:8px;
+  padding:4px 8px;
+  border-radius:999px;
+  border:1px solid rgba(168,85,247,.22);
+  background:rgba(168,85,247,.08);
+  color:#c9a7ef;
+  font-size:11px;
+  font-weight:800;
+}
+
 </style>
 </head>
 <body>
@@ -3506,7 +3608,8 @@ const state={
  messagesLoading:false,lastMessageSignature:"",sendingMessage:false,
  messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
  pendingImage:null,unreads:{public:{},dms:{},servers:{},server_totals:{},friends_total:0,total:0},
- unreadPoll:null,notificationPermission:"default",lastNotified:{}
+ unreadPoll:null,notificationPermission:"default",lastNotified:{},
+ call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:""}
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -4112,7 +4215,7 @@ function renderApp(){
 
 function renderChat(){
  const title=state.view==="public"?(state.channel==="chat1"?"# Chat 1":"# Chat 2"):"Chat";
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${notificationBellButton()}</div></header>
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${callButton()}${notificationBellButton()}</div></header>
  <div class="content"><div id="messageList" class="messages"></div></div>
  ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
  appShell.classList.remove("with-members");
@@ -4391,6 +4494,154 @@ function renderTypingIndicator(){
  `;
 }
 
+
+
+const VYNTRA_RTC_CONFIG={iceServers:[
+ {urls:"stun:stun.l.google.com:19302"},
+ {urls:"stun:stun1.l.google.com:19302"}
+]};
+
+function currentCallScopePayload(){
+ if(state.view==="public")return {kind:"public",channel:state.channel};
+ if(state.view==="server")return {kind:"server",channel:state.channel,server_id:state.activeServer};
+ if(state.view==="dm")return {kind:"dm",chat_id:state.activeChat};
+ return null;
+}
+function callButton(){
+ return `<button class="roundBtn callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"startCall()"}" title="${state.call.active?"Open call":"Start call"}">${state.call.active?"☎":"♬"}</button>`;
+}
+async function enumerateCallDevices(){
+ if(!navigator.mediaDevices?.enumerateDevices)return {mics:[],cameras:[]};
+ const all=await navigator.mediaDevices.enumerateDevices();
+ return {mics:all.filter(x=>x.kind==="audioinput"),cameras:all.filter(x=>x.kind==="videoinput")};
+}
+async function ensureCallAudio(){
+ if(state.call.localStream)return state.call.localStream;
+ const stream=await navigator.mediaDevices.getUserMedia({audio:state.call.selectedMic?{deviceId:{exact:state.call.selectedMic}}:true,video:false});
+ state.call.localStream=stream; return stream;
+}
+async function startCall(){
+ if(state.call.active)return openCallPanel();
+ if(!navigator.mediaDevices?.getUserMedia){toast("Calling is not supported by this browser.");return}
+ const scope=currentCallScopePayload(); if(!scope){toast("Open a messaging channel first.");return}
+ try{
+  await ensureCallAudio();
+  const d=await api("/api/calls/join",{method:"POST",body:JSON.stringify(scope)});
+  state.call.active=true;state.call.scopeKey=d.scope_key;state.call.participants=d.participants||[];state.call.signalAfter=0;
+  await syncCallPeers();startCallPolling();await openCallPanel();
+ }catch(e){toast(e.message||"Could not start call")}
+}
+function startCallPolling(){
+ clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);
+ state.call.signalPoll=setInterval(pollCallSignals,850);state.call.heartbeatPoll=setInterval(callHeartbeat,5000);
+ pollCallSignals();callHeartbeat();
+}
+async function callHeartbeat(){
+ if(!state.call.active)return;
+ try{const d=await api("/api/calls/heartbeat",{method:"POST",body:JSON.stringify({scope_key:state.call.scopeKey})});state.call.participants=d.participants||[];await syncCallPeers();renderCallParticipants()}catch(e){}
+}
+async function syncCallPeers(){
+ if(!state.call.active)return;
+ const me=Number(state.me.id), wanted=new Set((state.call.participants||[]).map(p=>Number(p.id)).filter(id=>id!==me));
+ Object.keys(state.call.peers).forEach(id=>{if(!wanted.has(Number(id)))closeCallPeer(Number(id))});
+ for(const p of state.call.participants||[]){const id=Number(p.id);if(id===me||state.call.peers[id])continue;await createCallPeer(id,me<id)}
+}
+async function createCallPeer(remoteId,makeOffer){
+ const pc=new RTCPeerConnection(VYNTRA_RTC_CONFIG);const remoteStream=new MediaStream();
+ state.call.peers[remoteId]={pc,stream:remoteStream};
+ const audio=await ensureCallAudio();audio.getAudioTracks().forEach(track=>pc.addTrack(track,audio));
+ if(state.call.videoStream){const vt=state.call.videoStream.getVideoTracks()[0];if(vt)pc.addTrack(vt,state.call.videoStream)}
+ pc.onicecandidate=e=>{if(e.candidate)sendCallSignal(remoteId,"ice",{candidate:e.candidate.toJSON()})};
+ pc.ontrack=e=>{e.streams[0]?.getTracks().forEach(track=>{if(!remoteStream.getTracks().some(t=>t.id===track.id))remoteStream.addTrack(track)});renderCallParticipants()};
+ pc.onconnectionstatechange=()=>{if(pc.connectionState==="failed")toast("A call connection failed. Try leaving and rejoining.")};
+ if(makeOffer){const offer=await pc.createOffer();await pc.setLocalDescription(offer);await sendCallSignal(remoteId,"offer",{sdp:pc.localDescription.toJSON()})}
+ return pc;
+}
+async function sendCallSignal(uid,type,payload){
+ try{await api("/api/calls/signal",{method:"POST",body:JSON.stringify({scope_key:state.call.scopeKey,to_user_id:uid,signal_type:type,payload})})}catch(e){}
+}
+async function pollCallSignals(){
+ if(!state.call.active)return;
+ try{
+  const d=await api(`/api/calls/signals?scope_key=${encodeURIComponent(state.call.scopeKey)}&after_id=${state.call.signalAfter||0}`);
+  for(const s of d.signals||[]){
+   state.call.signalAfter=Math.max(state.call.signalAfter||0,Number(s.id));const uid=Number(s.from_user_id);
+   if(!state.call.peers[uid])await createCallPeer(uid,false);const pc=state.call.peers[uid].pc;
+   if(s.signal_type==="offer"){
+    await pc.setRemoteDescription(new RTCSessionDescription(s.payload.sdp));const answer=await pc.createAnswer();await pc.setLocalDescription(answer);await sendCallSignal(uid,"answer",{sdp:pc.localDescription.toJSON()});
+   }else if(s.signal_type==="answer"){
+    if(pc.signalingState!=="stable")await pc.setRemoteDescription(new RTCSessionDescription(s.payload.sdp));
+   }else if(s.signal_type==="ice"){
+    try{await pc.addIceCandidate(new RTCIceCandidate(s.payload.candidate))}catch(e){}
+   }
+  }
+ }catch(e){}
+}
+function closeCallPeer(uid){const p=state.call.peers[uid];if(!p)return;try{p.pc.close()}catch(e){};delete state.call.peers[uid];renderCallParticipants()}
+async function leaveCall(){
+ if(!state.call.active)return;
+ try{await api("/api/calls/leave",{method:"POST",body:JSON.stringify({scope_key:state.call.scopeKey})})}catch(e){}
+ clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);Object.values(state.call.peers).forEach(p=>{try{p.pc.close()}catch(e){}});
+ state.call.localStream?.getTracks().forEach(t=>t.stop());state.call.videoStream?.getTracks().forEach(t=>t.stop());
+ const mic=state.call.selectedMic,cam=state.call.selectedCamera;
+ state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam};
+ document.querySelectorAll('[id^="callAudio-"]').forEach(e=>e.remove());modalClose();renderApp();toast("Left call");
+}
+function toggleCallMute(){state.call.micEnabled=!state.call.micEnabled;state.call.localStream?.getAudioTracks().forEach(t=>t.enabled=state.call.micEnabled);updateCallControls()}
+async function setOutgoingVideoTrack(track,stream){
+ for(const p of Object.values(state.call.peers)){
+  let sender=p.pc.getSenders().find(s=>s.track?.kind==="video");
+  if(sender)await sender.replaceTrack(track||null);else if(track)p.pc.addTrack(track,stream);
+ }
+}
+async function toggleCamera(){
+ try{
+  if(state.call.sharingScreen){toast("Stop screen sharing before turning on the camera.");return}
+  if(state.call.cameraEnabled){state.call.videoStream?.getTracks().forEach(t=>t.stop());await setOutgoingVideoTrack(null,null);state.call.videoStream=null;state.call.cameraEnabled=false;renderCallParticipants();updateCallControls();return}
+  const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:state.call.selectedCamera?{deviceId:{exact:state.call.selectedCamera}}:true});
+  state.call.videoStream=stream;state.call.cameraEnabled=true;const track=stream.getVideoTracks()[0];await setOutgoingVideoTrack(track,stream);track.onended=()=>{if(state.call.cameraEnabled)toggleCamera()};renderCallParticipants();updateCallControls();
+ }catch(e){toast(e.message||"Could not use camera")}
+}
+async function toggleScreenShare(){
+ if(!navigator.mediaDevices?.getDisplayMedia){toast("Screen sharing is not available in this browser.");return}
+ try{
+  if(state.call.sharingScreen){await stopScreenShare();return}
+  if(state.call.cameraEnabled)await toggleCamera();
+  const stream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});state.call.videoStream=stream;state.call.sharingScreen=true;const track=stream.getVideoTracks()[0];await setOutgoingVideoTrack(track,stream);track.onended=()=>stopScreenShare();renderCallParticipants();updateCallControls();
+ }catch(e){if(e?.name!=="NotAllowedError")toast(e.message||"Could not share screen")}
+}
+async function stopScreenShare(){
+ if(!state.call.sharingScreen)return;const stream=state.call.videoStream;state.call.sharingScreen=false;state.call.videoStream=null;await setOutgoingVideoTrack(null,null);stream?.getTracks().forEach(t=>t.stop());renderCallParticipants();updateCallControls();
+}
+async function changeCallMic(el){
+ state.call.selectedMic=el.value;if(!state.call.active)return;
+ try{const stream=await navigator.mediaDevices.getUserMedia({audio:el.value?{deviceId:{exact:el.value}}:true,video:false});const track=stream.getAudioTracks()[0];track.enabled=state.call.micEnabled;for(const p of Object.values(state.call.peers)){const s=p.pc.getSenders().find(x=>x.track?.kind==="audio");if(s)await s.replaceTrack(track)}state.call.localStream?.getAudioTracks().forEach(t=>t.stop());state.call.localStream=new MediaStream([track]);toast("Microphone changed")}catch(e){toast(e.message||"Could not change microphone")}
+}
+async function changeCallCamera(el){state.call.selectedCamera=el.value;if(state.call.cameraEnabled){await toggleCamera();await toggleCamera()}}
+async function openCallPanel(){
+ if(!state.call.active)return startCall();
+ let devices={mics:[],cameras:[]};try{devices=await enumerateCallDevices()}catch(e){}
+ modalOpen("VYNTRA Call",`<div class="callPanel">
+  <div class="callHeaderCard"><div><div class="listTitle">Connected Call</div><div class="listSub">${state.call.participants.length} participant${state.call.participants.length===1?"":"s"}</div></div><button class="danger" onclick="leaveCall()">Leave</button></div>
+  <div id="callParticipants" class="callParticipants"></div>
+  <div class="callControls"><button id="callMuteBtn" class="callControlBtn" onclick="toggleCallMute()"></button><button id="callCameraBtn" class="callControlBtn" onclick="toggleCamera()"></button><button id="callScreenBtn" class="callControlBtn" onclick="toggleScreenShare()"></button></div>
+  <div class="grid2 callDeviceGrid"><div><div class="label">Microphone</div><select class="field" onchange="changeCallMic(this)"><option value="">Default microphone</option>${devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedMic===d.deviceId?"selected":""}>${esc(d.label||`Microphone ${i+1}`)}</option>`).join("")}</select></div><div><div class="label">Camera</div><select class="field" onchange="changeCallCamera(this)"><option value="">Default camera</option>${devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedCamera===d.deviceId?"selected":""}>${esc(d.label||`Camera ${i+1}`)}</option>`).join("")}</select></div></div>
+  <div class="callHint">Camera and microphone access require permission. Screen sharing availability depends on your phone/browser.</div>
+ </div>`);renderCallParticipants();updateCallControls();
+}
+function updateCallControls(){
+ const m=document.getElementById("callMuteBtn"),c=document.getElementById("callCameraBtn"),s=document.getElementById("callScreenBtn");
+ if(m){m.textContent=state.call.micEnabled?"🎤 Mute":"🔇 Unmute";m.classList.toggle("off",!state.call.micEnabled)}
+ if(c){c.textContent=state.call.cameraEnabled?"📷 Camera Off":"📷 Camera On";c.classList.toggle("active",state.call.cameraEnabled)}
+ if(s){s.textContent=state.call.sharingScreen?"🖥 Stop Sharing":"🖥 Share Screen";s.classList.toggle("active",state.call.sharingScreen)}
+}
+function renderCallParticipants(){
+ const el=document.getElementById("callParticipants");if(!el)return;const me=Number(state.me.id);const people=[{id:me,username:state.profile.username,avatar:state.profile.avatar,local:true,stream:state.call.videoStream||state.call.localStream}];
+ for(const p of state.call.participants||[]){const id=Number(p.id);if(id===me)continue;people.push({...p,local:false,stream:state.call.peers[id]?.stream||null})}
+ el.innerHTML=people.map(p=>`<div class="callTile"><div class="callVideoWrap">${p.stream&&p.stream.getVideoTracks().length?`<video id="callVideo-${p.id}" autoplay playsinline ${p.local?"muted":""}></video>`:`<div class="callAvatarFallback"><img src="${avatarSrc(p.avatar)}"><span>${esc(p.username)}</span></div>`}</div><div class="callTileFooter"><span>${esc(p.username)}${p.local?" (You)":""}</span>${p.local&&!state.call.micEnabled?`<span class="pill">Muted</span>`:""}${p.local&&state.call.sharingScreen?`<span class="pill">Sharing</span>`:""}</div></div>`).join("");
+ for(const p of people){if(p.stream&&p.stream.getVideoTracks().length){const v=document.getElementById(`callVideo-${p.id}`);if(v){v.srcObject=p.stream;v.play().catch(()=>{})}}if(!p.local&&p.stream){let a=document.getElementById(`callAudio-${p.id}`);if(!a){a=document.createElement("audio");a.id=`callAudio-${p.id}`;a.autoplay=true;a.style.display="none";document.body.appendChild(a)}a.srcObject=p.stream;a.play().catch(()=>{})}}
+}
+window.addEventListener("beforeunload",()=>{if(state.call.active&&state.call.scopeKey){try{navigator.sendBeacon("/api/calls/leave",new Blob([JSON.stringify({scope_key:state.call.scopeKey})],{type:"application/json"}))}catch(e){}}});
 
 function photoComposerControls(){
  return `<button class="photoSendBtn" type="button" onclick="choosePhoto()" title="Send photo">📷</button>
@@ -4931,7 +5182,7 @@ async function viewProfile(uid){
      </div>
 
      <div class="card" style="margin-top:14px">
-       <div class="listSub">Vyntra ID: #${p.id}</div>
+       <div class="listSub">Vyntra ID: #${p.id}</div>${p.friend_status==="friends"?`<div class="profileFriendStatus">Friends</div>`:""}
        ${p.server_role?`<div class="profileRoleSection"><div class="label">Server Roles</div><div class="profileRoleBadges"><span class="pill">${esc(p.server_role)}</span>${(p.server_roles||[]).map(r=>`<span class="pill">${esc(r.name)}</span>`).join("")}</div></div>`:""}
        <div class="muted" style="margin-top:8px">${esc(p.pronouns||"No pronouns set")}</div>
        <p>${esc(p.description||"No description.")}</p>
@@ -4940,7 +5191,15 @@ async function viewProfile(uid){
 
      ${Number(uid)!==Number(state.me.id)
        ?`<div class="modalActions">
-          <button class="primary" onclick="addFriend(${uid});modalClose()">Add friend</button>
+          ${
+            p.friend_status==="friends"
+              ?`<button class="ghost" disabled>Friends</button>`
+              :p.friend_status==="pending_sent"
+                ?`<button class="ghost" disabled>Friend Request Sent</button>`
+                :p.friend_status==="pending_received"
+                  ?`<button class="primary" onclick="showFriendsPage();modalClose()">Respond to Request</button>`
+                  :`<button class="primary" onclick="addFriend(${uid});modalClose()">Add Friend</button>`
+          }
           <button class="ghost" onclick="startDM(${uid});modalClose()">Message</button>
         </div>`
        :""
@@ -5007,7 +5266,7 @@ async function renderDM(id){
  root.innerHTML=`<div id="appShell" class="app">${sidebar()}<main class="main"><div id="mainArea" style="height:100%;display:flex;flex-direction:column"></div></main><aside id="membersPane" class="membersPane"></aside></div>${mobilebar()}`;
  let info=await api("/api/chats/"+id);
  await markChatNotificationsRead(id);
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${callButton()}${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
  loadMessages(true);attachTypingListener();renderPhotoPreview();state.poll=setInterval(loadMessages,2000);
 }
 function groupCreate(){modalOpen("Create group chat",`<form class="formGrid" onsubmit="makeGroup(event)"><div class="label">Group name</div><input id="groupName" class="field" maxlength="50" required><div class="label">Add usernames</div><input id="groupUsers" class="field" placeholder="alex, sam, jordan"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create</button></div></form>`)}
@@ -5257,8 +5516,9 @@ function renderServer(){
  clearInterval(state.poll);
  const s=state.serverInfo; if(!s){openPublic("chat1");return}
  if(window.innerWidth>1000)appShell.classList.add("with-members");else appShell.classList.remove("with-members");
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions serverDesktopActions">${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div><button class="roundBtn serverMobileMenu" onclick="showMobileServerActions()">•••</button></header>
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions serverDesktopActions">${callButton()}${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div><button class="roundBtn serverMobileMenu" onclick="showMobileServerActions()">•••</button></header>
  <div class="mobileServerQuickBar">
+   <button class="mobileCallQuick" onclick="${state.call.active?"openCallPanel()":"startCall()"}">${state.call.active?"Open Call":"Call"}</button>
    <button onclick="showMobileMembers()">Members</button>
    ${hasServerPerm("manage_channels")?`<button onclick="createChannelPrompt()">＋ Channel</button>`:""}
    ${hasServerPerm("manage_channels")?`<button onclick="openMobileCurrentChannelSettings()">Edit Channel</button>`:""}
@@ -7289,6 +7549,32 @@ def profile_get(uid):
             {"id":r[0],"name":r[1]}
             for r in roles
         ]
+
+
+    profile["friend_status"]="self" if uid==request.me["id"] else "none"
+
+    if uid!=request.me["id"]:
+        with connect() as c:
+            # Support either ordering in the friendship row.
+            fr=c.execute("""
+                select status,user_id,friend_id
+                from friendships
+                where (user_id=%s and friend_id=%s)
+                   or (user_id=%s and friend_id=%s)
+                limit 1
+            """,(request.me["id"],uid,uid,request.me["id"])).fetchone()
+
+        if fr:
+            status=str(fr[0] or "").lower()
+
+            if status in ("accepted","friends","friend"):
+                profile["friend_status"]="friends"
+            elif status in ("pending","requested"):
+                # Distinguish sent vs received if possible.
+                if int(fr[1])==int(request.me["id"]):
+                    profile["friend_status"]="pending_sent"
+                else:
+                    profile["friend_status"]="pending_received"
 
     return jsonify(profile=profile)
 
@@ -9353,6 +9639,101 @@ def typing_update():
     return jsonify(ok=True)
 
 
+
+
+@app.post("/api/calls/join")
+@login_required
+def call_join():
+    d=request.get_json(silent=True) or {}
+    kind=str(d.get("kind","")); channel=d.get("channel")
+    sid=d.get("server_id"); cid=d.get("chat_id")
+    try:
+        scope=call_scope_key(kind,channel,sid,cid)
+    except Exception:
+        return jsonify(error="Invalid call scope"),400
+    if not scope or not verify_call_access(kind,request.me["id"],channel,sid,cid):
+        return jsonify(error="You cannot join this call"),403
+    with connect() as c:
+        c.execute("""
+            insert into call_participants(scope_key,user_id,joined_at,last_seen)
+            values(%s,%s,now(),now())
+            on conflict(scope_key,user_id) do update set last_seen=now()
+        """,(scope,request.me["id"]))
+        c.execute("delete from call_participants where last_seen < now()-interval '20 seconds'")
+        c.execute("delete from call_signals where created_at < now()-interval '2 minutes'")
+        rows=c.execute("""
+            select cp.user_id,u.username,u.avatar,u.device_type
+            from call_participants cp join users u on u.id=cp.user_id
+            where cp.scope_key=%s and cp.last_seen >= now()-interval '20 seconds'
+            order by cp.joined_at
+        """,(scope,)).fetchall()
+        c.commit()
+    return jsonify(scope_key=scope,participants=[
+        {"id":r[0],"username":r[1],"avatar":r[2],"device_type":r[3]} for r in rows
+    ])
+
+@app.post("/api/calls/heartbeat")
+@login_required
+def call_heartbeat():
+    d=request.get_json(silent=True) or {}; scope=str(d.get("scope_key",""))
+    if not scope:return jsonify(error="Missing call scope"),400
+    with connect() as c:
+        c.execute("update call_participants set last_seen=now() where scope_key=%s and user_id=%s",(scope,request.me["id"]))
+        rows=c.execute("""
+            select cp.user_id,u.username,u.avatar,u.device_type
+            from call_participants cp join users u on u.id=cp.user_id
+            where cp.scope_key=%s and cp.last_seen >= now()-interval '20 seconds'
+            order by cp.joined_at
+        """,(scope,)).fetchall()
+        c.commit()
+    return jsonify(participants=[{"id":r[0],"username":r[1],"avatar":r[2],"device_type":r[3]} for r in rows])
+
+@app.post("/api/calls/leave")
+@login_required
+def call_leave():
+    d=request.get_json(silent=True) or {}; scope=str(d.get("scope_key",""))
+    if not scope:return jsonify(ok=True)
+    with connect() as c:
+        c.execute("delete from call_participants where scope_key=%s and user_id=%s",(scope,request.me["id"]))
+        c.execute("delete from call_signals where scope_key=%s and (from_user_id=%s or to_user_id=%s)",(scope,request.me["id"],request.me["id"]))
+        c.commit()
+    return jsonify(ok=True)
+
+@app.post("/api/calls/signal")
+@login_required
+def call_signal_send():
+    d=request.get_json(silent=True) or {}
+    scope=str(d.get("scope_key","")); typ=str(d.get("signal_type","")); payload=d.get("payload")
+    try: to_uid=int(d.get("to_user_id"))
+    except Exception:return jsonify(error="Invalid target user"),400
+    if not scope or typ not in ("offer","answer","ice") or not isinstance(payload,dict):
+        return jsonify(error="Invalid call signal"),400
+    with connect() as c:
+        sender=c.execute("select 1 from call_participants where scope_key=%s and user_id=%s and last_seen>=now()-interval '20 seconds'",(scope,request.me["id"])).fetchone()
+        target=c.execute("select 1 from call_participants where scope_key=%s and user_id=%s and last_seen>=now()-interval '20 seconds'",(scope,to_uid)).fetchone()
+        if not sender or not target:return jsonify(error="Call participant unavailable"),404
+        c.execute("""
+            insert into call_signals(scope_key,from_user_id,to_user_id,signal_type,payload)
+            values(%s,%s,%s,%s,%s)
+        """,(scope,request.me["id"],to_uid,typ,psycopg.types.json.Jsonb(payload)))
+        c.commit()
+    return jsonify(ok=True)
+
+@app.get("/api/calls/signals")
+@login_required
+def call_signal_get():
+    scope=request.args.get("scope_key","")
+    try: after_id=int(request.args.get("after_id","0"))
+    except Exception: after_id=0
+    if not scope:return jsonify(signals=[])
+    with connect() as c:
+        rows=c.execute("""
+            select cs.id,cs.from_user_id,cs.signal_type,cs.payload,u.username,u.avatar
+            from call_signals cs join users u on u.id=cs.from_user_id
+            where cs.scope_key=%s and cs.to_user_id=%s and cs.id>%s
+            order by cs.id limit 100
+        """,(scope,request.me["id"],after_id)).fetchall()
+    return jsonify(signals=[{"id":r[0],"from_user_id":r[1],"signal_type":r[2],"payload":r[3],"username":r[4],"avatar":r[5]} for r in rows])
 
 @app.post("/api/read-state")
 @login_required
