@@ -3699,6 +3699,14 @@ body.iphone11PreviewMode{
   }
 }
 
+
+.callPolicyStatus{
+  margin-top:8px;
+  color:#8fe9ab;
+  font-size:10px;
+  font-weight:800;
+}
+
 </style>
 </head>
 <body>
@@ -4651,6 +4659,7 @@ async function openCallSetup(){
    <div class="callSetupIntro">
      <div class="listTitle">Set up your call</div>
      <div class="listSub">VYNTRA will test your microphone and camera before joining. Your camera stays off until you turn it on in the call.</div>
+     <div class="callPolicyStatus">Secure media access enabled for this VYNTRA page.</div>
    </div>
 
    <div class="callSetupDevice">
@@ -4780,10 +4789,10 @@ async function testCallMicrophone(){
 
    state.call.micError=
      state.call.micPermission==="denied"
-       ?"Microphone is blocked by the browser/site permission."
+       ?`Microphone request was denied (${e?.name||"NotAllowedError"}): ${e?.message||"Access denied"}`
        :state.call.micPermission==="missing"
          ?"No microphone was found."
-         :(e?.message||"Microphone test failed.");
+         :`${e?.name||"MediaError"}: ${e?.message||"Microphone test failed."}`;
 
    if(result){
      result.textContent=state.call.micError;
@@ -4844,10 +4853,10 @@ async function testCallCamera(){
 
    state.call.cameraError=
      state.call.cameraPermission==="denied"
-       ?"Camera is blocked by the browser/site permission."
+       ?`Camera request was denied (${e?.name||"NotAllowedError"}): ${e?.message||"Access denied"}`
        :state.call.cameraPermission==="missing"
          ?"No camera was found."
-         :(e?.message||"Camera test failed.");
+         :`${e?.name||"MediaError"}: ${e?.message||"Camera test failed."}`;
 
    if(result){
      result.textContent=state.call.cameraError;
@@ -7146,7 +7155,7 @@ def add_security_headers(response):
     response.headers["X-Content-Type-Options"]="nosniff"
     response.headers["X-Frame-Options"]="DENY"
     response.headers["Referrer-Policy"]="no-referrer"
-    response.headers["Permissions-Policy"]="camera=(), microphone=(), geolocation=()"
+    response.headers["Permissions-Policy"]="camera=(self), microphone=(self), display-capture=(self), geolocation=()"
     response.headers["Content-Security-Policy"]="default-src 'self'; img-src 'self' data: https: http:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     if request.is_secure:
         response.headers["Strict-Transport-Security"]="max-age=31536000; includeSubDomains"
