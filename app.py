@@ -3624,6 +3624,81 @@ body.iphone11PreviewMode{
  .callPermissionWarning{flex-direction:column;align-items:stretch}
 }
 
+
+/* ============================================================
+   VYNTRA CALL DEVICE PREFLIGHT
+   ============================================================ */
+.callSetupIntro{
+  padding:4px 2px 10px;
+}
+.callSetupDevice{
+  display:flex;
+  flex-direction:column;
+  gap:9px;
+  padding:13px;
+  margin-top:10px;
+  border:1px solid rgba(255,255,255,.07);
+  background:#131019;
+  border-radius:15px;
+}
+.callPermissionButton{
+  width:100%;
+}
+.callDeviceStatus{
+  display:inline-flex;
+  align-items:center;
+  padding:4px 8px;
+  border-radius:999px;
+  background:rgba(255,255,255,.06);
+  color:#a79daf;
+  font-size:10px;
+  font-weight:900;
+}
+.goodStatus{
+  color:#9bf0b6;
+  background:rgba(74,222,128,.08);
+}
+.badStatus{
+  color:#ffadb9;
+  background:rgba(244,63,94,.08);
+}
+.callTestResult{
+  min-height:18px;
+  color:#93899c;
+  font-size:11px;
+}
+.goodTest{color:#8fe9ab}
+.badTest{color:#ff9dac}
+.callSetupPreview{
+  display:none;
+  width:100%;
+  max-height:260px;
+  object-fit:cover;
+  border-radius:12px;
+  background:#08070a;
+}
+.callSetupActions{
+  display:flex;
+  justify-content:flex-end;
+  gap:8px;
+  margin-top:14px;
+}
+.callJoinBigBtn{
+  min-width:140px;
+  min-height:42px;
+  font-size:13px;
+  font-weight:900;
+}
+@media(max-width:720px){
+  .callSetupActions{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+  }
+  .callJoinBigBtn{
+    min-width:0;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -3641,7 +3716,7 @@ const state={
  messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
  pendingImage:null,unreads:{public:{},dms:{},servers:{},server_totals:{},friends_total:0,total:0},
  unreadPoll:null,notificationPermission:"default",lastNotified:{},
- call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:"",micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:""}
+ call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:"",micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null}
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -4540,8 +4615,268 @@ function currentCallScopePayload(){
  return null;
 }
 function callButton(){
- return `<button class="callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"startCall()"}" title="${state.call.active?"Open current call":"Start call"}"><span class="callTopIcon">☎</span><span>${state.call.active?"In Call":"Call"}</span></button>`;
+ return `<button class="callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"openCallSetup()"}" title="${state.call.active?"Open current call":"Start call"}"><span class="callTopIcon">☎</span><span>${state.call.active?"In Call":"Call"}</span></button>`;
 }
+
+function callPermissionStatus(kind){
+ const value=kind==="mic"?state.call.micPermission:state.call.cameraPermission;
+
+ if(value==="granted")return `<span class="callDeviceStatus goodStatus">Ready</span>`;
+ if(value==="denied")return `<span class="callDeviceStatus badStatus">Blocked</span>`;
+ if(value==="missing")return `<span class="callDeviceStatus badStatus">Not Found</span>`;
+ if(value==="error")return `<span class="callDeviceStatus badStatus">Error</span>`;
+ return `<span class="callDeviceStatus">Not Tested</span>`;
+}
+
+async function openCallSetup(){
+ if(state.call.active){
+   openCallPanel();
+   return;
+ }
+
+ const scope=currentCallScopePayload();
+
+ if(!scope){
+   toast("Open a messaging channel first.");
+   return;
+ }
+
+ let devices={mics:[],cameras:[]};
+
+ try{
+   devices=await enumerateCallDevices();
+ }catch(e){}
+
+ modalOpen("Call Setup",`
+   <div class="callSetupIntro">
+     <div class="listTitle">Set up your call</div>
+     <div class="listSub">VYNTRA will test your microphone and camera before joining. Your camera stays off until you turn it on in the call.</div>
+   </div>
+
+   <div class="callSetupDevice">
+     <div class="row between">
+       <div>
+         <div class="listTitle">Microphone</div>
+         <div class="listSub">Choose and test the microphone you want to use.</div>
+       </div>
+       ${callPermissionStatus("mic")}
+     </div>
+
+     <select id="callSetupMic" class="field" onchange="state.call.selectedMic=this.value">
+       <option value="">Default microphone</option>
+       ${devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedMic===d.deviceId?"selected":""}>${esc(d.label||`Microphone ${i+1}`)}</option>`).join("")}
+     </select>
+
+     <button class="primary callPermissionButton" onclick="testCallMicrophone()">Enable / Test Microphone</button>
+
+     <div id="callMicTestResult" class="callTestResult">
+       ${state.call.micPermission==="granted"?"Microphone is ready.":esc(state.call.micError||"")}
+     </div>
+   </div>
+
+   <div class="callSetupDevice">
+     <div class="row between">
+       <div>
+         <div class="listTitle">Camera</div>
+         <div class="listSub">Choose and test your camera. Testing does not turn it on for the call.</div>
+       </div>
+       ${callPermissionStatus("camera")}
+     </div>
+
+     <select id="callSetupCamera" class="field" onchange="state.call.selectedCamera=this.value">
+       <option value="">Default camera</option>
+       ${devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedCamera===d.deviceId?"selected":""}>${esc(d.label||`Camera ${i+1}`)}</option>`).join("")}
+     </select>
+
+     <button class="primary callPermissionButton" onclick="testCallCamera()">Enable / Test Camera</button>
+
+     <div id="callCameraTestResult" class="callTestResult">
+       ${state.call.cameraPermission==="granted"?"Camera is ready.":esc(state.call.cameraError||"")}
+     </div>
+
+     <video id="callCameraPreview" class="callSetupPreview" autoplay muted playsinline></video>
+   </div>
+
+   <div class="callSetupActions">
+     <button class="ghost" onclick="closeCallSetup()">Cancel</button>
+     <button class="primary callJoinBigBtn" onclick="joinCallAfterSetup()">Join Call</button>
+   </div>
+ `);
+
+ // If access had already been granted earlier, device labels become available
+ // only after getUserMedia has succeeded. Refresh selectors after a moment.
+ setTimeout(refreshCallSetupDevices,150);
+}
+
+async function refreshCallSetupDevices(){
+ if(!document.getElementById("callSetupMic"))return;
+
+ try{
+   const devices=await enumerateCallDevices();
+
+   const mic=document.getElementById("callSetupMic");
+   const cam=document.getElementById("callSetupCamera");
+
+   if(mic){
+     const selected=state.call.selectedMic||mic.value;
+     mic.innerHTML=`<option value="">Default microphone</option>`+
+       devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}">${esc(d.label||`Microphone ${i+1}`)}</option>`).join("");
+     mic.value=selected;
+   }
+
+   if(cam){
+     const selected=state.call.selectedCamera||cam.value;
+     cam.innerHTML=`<option value="">Default camera</option>`+
+       devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}">${esc(d.label||`Camera ${i+1}`)}</option>`).join("");
+     cam.value=selected;
+   }
+ }catch(e){}
+}
+
+async function testCallMicrophone(){
+ const result=document.getElementById("callMicTestResult");
+ const select=document.getElementById("callSetupMic");
+
+ if(select)state.call.selectedMic=select.value;
+
+ if(result)result.textContent="Requesting microphone access...";
+
+ try{
+   state.call.preflightMicStream?.getTracks().forEach(t=>t.stop());
+
+   const stream=await navigator.mediaDevices.getUserMedia({
+     audio:state.call.selectedMic
+       ?{deviceId:{exact:state.call.selectedMic}}
+       :true,
+     video:false
+   });
+
+   const track=stream.getAudioTracks()[0];
+
+   if(!track){
+     throw new Error("Browser returned no microphone track.");
+   }
+
+   state.call.preflightMicStream=stream;
+   state.call.localStream=stream;
+   state.call.micPermission="granted";
+   state.call.micError="";
+   state.call.micEnabled=true;
+
+   if(result){
+     result.textContent=`Microphone ready: ${track.label||"Default microphone"}`;
+     result.className="callTestResult goodTest";
+   }
+
+   await refreshCallSetupDevices();
+
+ }catch(e){
+   state.call.micPermission=
+     e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"
+       ?"denied"
+       :e?.name==="NotFoundError"
+         ?"missing"
+         :"error";
+
+   state.call.micError=
+     state.call.micPermission==="denied"
+       ?"Microphone is blocked by the browser/site permission."
+       :state.call.micPermission==="missing"
+         ?"No microphone was found."
+         :(e?.message||"Microphone test failed.");
+
+   if(result){
+     result.textContent=state.call.micError;
+     result.className="callTestResult badTest";
+   }
+ }
+}
+
+async function testCallCamera(){
+ const result=document.getElementById("callCameraTestResult");
+ const preview=document.getElementById("callCameraPreview");
+ const select=document.getElementById("callSetupCamera");
+
+ if(select)state.call.selectedCamera=select.value;
+
+ if(result)result.textContent="Requesting camera access...";
+
+ try{
+   state.call.preflightCameraStream?.getTracks().forEach(t=>t.stop());
+
+   const stream=await navigator.mediaDevices.getUserMedia({
+     audio:false,
+     video:state.call.selectedCamera
+       ?{deviceId:{exact:state.call.selectedCamera}}
+       :true
+   });
+
+   const track=stream.getVideoTracks()[0];
+
+   if(!track){
+     throw new Error("Browser returned no camera track.");
+   }
+
+   state.call.preflightCameraStream=stream;
+   state.call.cameraPermission="granted";
+   state.call.cameraError="";
+
+   if(preview){
+     preview.srcObject=stream;
+     preview.style.display="block";
+     preview.play().catch(()=>{});
+   }
+
+   if(result){
+     result.textContent=`Camera ready: ${track.label||"Default camera"}`;
+     result.className="callTestResult goodTest";
+   }
+
+   await refreshCallSetupDevices();
+
+ }catch(e){
+   state.call.cameraPermission=
+     e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"
+       ?"denied"
+       :e?.name==="NotFoundError"
+         ?"missing"
+         :"error";
+
+   state.call.cameraError=
+     state.call.cameraPermission==="denied"
+       ?"Camera is blocked by the browser/site permission."
+       :state.call.cameraPermission==="missing"
+         ?"No camera was found."
+         :(e?.message||"Camera test failed.");
+
+   if(result){
+     result.textContent=state.call.cameraError;
+     result.className="callTestResult badTest";
+   }
+ }
+}
+
+function closeCallSetup(){
+ state.call.preflightCameraStream?.getTracks().forEach(t=>t.stop());
+ state.call.preflightCameraStream=null;
+
+ // Keep a successfully tested microphone stream available only if we're
+ // about to join; canceling should release it.
+ state.call.preflightMicStream?.getTracks().forEach(t=>t.stop());
+ state.call.preflightMicStream=null;
+ state.call.localStream=null;
+
+ modalClose();
+}
+
+async function joinCallAfterSetup(){
+ // Camera is only a permission/device test; turn the preview off before join.
+ state.call.preflightCameraStream?.getTracks().forEach(t=>t.stop());
+ state.call.preflightCameraStream=null;
+
+ await startCall(true);
+}
+
 async function enumerateCallDevices(){
  if(!navigator.mediaDevices?.enumerateDevices)return {mics:[],cameras:[]};
  const all=await navigator.mediaDevices.enumerateDevices();
@@ -4589,19 +4924,59 @@ async function requestInitialCallPermissions(){
   }
  }
 }
-async function startCall(){
+async function startCall(fromSetup=false){
  if(state.call.active)return openCallPanel();
- const scope=currentCallScopePayload();if(!scope){toast("Open a messaging channel first.");return}
+
+ if(!fromSetup){
+   await openCallSetup();
+   return;
+ }
+
+ const scope=currentCallScopePayload();
+ if(!scope){
+   toast("Open a messaging channel first.");
+   return;
+ }
+
  try{
-  await requestInitialCallPermissions();
-  const d=await api("/api/calls/join",{method:"POST",body:JSON.stringify(scope)});
-  state.call.active=true;state.call.scopeKey=d.scope_key;state.call.participants=d.participants||[];state.call.signalAfter=0;
-  await syncCallPeers();startCallPolling();await openCallPanel();
+   // If microphone was not tested or permission was denied, still join muted.
+   if(!state.call.localStream){
+     state.call.localStream=new MediaStream();
+     state.call.micEnabled=false;
+   }
+
+   const d=await api("/api/calls/join",{
+     method:"POST",
+     body:JSON.stringify(scope)
+   });
+
+   state.call.active=true;
+   state.call.scopeKey=d.scope_key;
+   state.call.participants=d.participants||[];
+   state.call.signalAfter=0;
+
+   // The preflight stream is now the real call microphone stream.
+   state.call.preflightMicStream=null;
+
+   modalClose();
+
+   await syncCallPeers();
+   startCallPolling();
+   await openCallPanel();
+
  }catch(e){
-  state.call.active=false;state.call.scopeKey="";
-  const msg=String(e?.message||"Could not start call");
-  if(msg.toLowerCase().includes("you cannot join this call"))toast("VYNTRA denied access to this call. Make sure you can view this channel or chat.");
-  else toast(msg);
+   state.call.active=false;
+   state.call.scopeKey="";
+
+   const msg=String(e?.message||"Could not start call");
+
+   if(msg.toLowerCase().includes("you cannot join this call")){
+     toast("Call access denied by VYNTRA. You may not have access to this channel/chat.");
+   }else if(msg.toLowerCase().includes("permission")){
+     toast("Call backend rejected the request: "+msg);
+   }else{
+     toast(msg);
+   }
  }
 }
 function startCallPolling(){
@@ -4657,7 +5032,7 @@ async function leaveCall(){
  clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);Object.values(state.call.peers).forEach(p=>{try{p.pc.close()}catch(e){}});
  state.call.localStream?.getTracks().forEach(t=>t.stop());state.call.videoStream?.getTracks().forEach(t=>t.stop());
  const mic=state.call.selectedMic,cam=state.call.selectedCamera;
- state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam,micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:""};
+ state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam,micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null};
  document.querySelectorAll('[id^="callAudio-"]').forEach(e=>e.remove());modalClose();renderApp();toast("Left call");
 }
 async function enableCallMicrophone(){
@@ -4734,7 +5109,7 @@ async function openCallPanel(){
   ${(state.call.micPermission==="denied"||state.call.cameraPermission==="denied")?`<div class="callPermissionWarning"><div><b>Device permission blocked</b><span>${state.call.micPermission==="denied"?"Microphone ":""}${state.call.micPermission==="denied"&&state.call.cameraPermission==="denied"?"and ":""}${state.call.cameraPermission==="denied"?"camera ":""}access is blocked. You can still stay in the call.</span></div><button class="ghost" onclick="openCallPermissionHelp('${state.call.micPermission==="denied"?"microphone":"camera"}')">Fix Permission</button></div>`:""}
   <div class="callControls"><button id="callMuteBtn" class="callControlBtn" onclick="toggleCallMute()"></button><button id="callCameraBtn" class="callControlBtn" onclick="toggleCamera()"></button><button id="callScreenBtn" class="callControlBtn" onclick="toggleScreenShare()"></button></div>
   <div class="grid2 callDeviceGrid"><div><div class="label">Microphone</div><select class="field" onchange="changeCallMic(this)"><option value="">Default microphone</option>${devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedMic===d.deviceId?"selected":""}>${esc(d.label||`Microphone ${i+1}`)}</option>`).join("")}</select></div><div><div class="label">Camera</div><select class="field" onchange="changeCallCamera(this)"><option value="">Default camera</option>${devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedCamera===d.deviceId?"selected":""}>${esc(d.label||`Camera ${i+1}`)}</option>`).join("")}</select></div></div>
-  <div class="callHint">Camera and microphone access require permission. Screen sharing availability depends on your phone/browser.</div>
+  <div class="callHint">Microphone: ${state.call.micPermission==="granted"?"Ready":state.call.micPermission}. Camera permission: ${state.call.cameraPermission==="granted"?"Ready":state.call.cameraPermission}. Screen sharing availability depends on your phone/browser.</div>
  </div>`);renderCallParticipants();updateCallControls();
 }
 function updateCallControls(){
