@@ -3809,6 +3809,38 @@ body.iphone11PreviewMode{
   }
 }
 
+
+/* ============================================================
+   VYNTRA REMOTE CAMERA + SCREEN SHARE FIX
+   ============================================================ */
+.callMediaStatus{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  padding:8px 10px;
+  border-radius:11px;
+  background:rgba(255,255,255,.035);
+  color:#8f8599;
+  font-size:10px;
+  font-weight:800;
+}
+.callMediaLive{
+  color:#75e89b;
+}
+.callTile.hasVideo .callVideoWrap{
+  background:#050407;
+}
+.callTile.hasVideo video{
+  background:#050407;
+}
+@media(max-width:720px){
+  .callMediaStatus{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -5257,16 +5289,112 @@ async function syncCallPeers(){
  for(const p of state.call.participants||[]){const id=Number(p.id);if(id===me||state.call.peers[id])continue;await createCallPeer(id,me<id)}
 }
 async function createCallPeer(remoteId,makeOffer){
- const pc=new RTCPeerConnection(VYNTRA_RTC_CONFIG);const remoteStream=new MediaStream();
- state.call.peers[remoteId]={pc,stream:remoteStream};
- const audio=await ensureCallAudio(false);audio.getAudioTracks().forEach(track=>pc.addTrack(track,audio));
- if(state.call.videoStream){const vt=state.call.videoStream.getVideoTracks()[0];if(vt)pc.addTrack(vt,state.call.videoStream)}
- pc.onicecandidate=e=>{if(e.candidate)sendCallSignal(remoteId,"ice",{candidate:e.candidate.toJSON()})};
- pc.ontrack=e=>{e.streams[0]?.getTracks().forEach(track=>{if(!remoteStream.getTracks().some(t=>t.id===track.id))remoteStream.addTrack(track)});renderCallParticipants()};
- pc.onconnectionstatechange=()=>{if(pc.connectionState==="failed")toast("A call connection failed. Try leaving and rejoining.")};
- if(makeOffer){const offer=await pc.createOffer();await pc.setLocalDescription(offer);await sendCallSignal(remoteId,"offer",{sdp:pc.localDescription.toJSON()})}
+ const pc=new RTCPeerConnection(VYNTRA_RTC_CONFIG);
+ const remoteStream=new MediaStream();
+
+ state.call.peers[remoteId]={
+   pc,
+   stream:remoteStream,
+   videoSender:null
+ };
+
+ const audio=await ensureCallAudio(false);
+ audio.getAudioTracks().forEach(track=>pc.addTrack(track,audio));
+
+ // The OFFERER reserves one send/receive video m-line from the beginning.
+ // This lets camera and screen sharing turn on later with replaceTrack()
+ // without needing a second negotiation just to add video.
+ if(makeOffer){
+   const tx=pc.addTransceiver("video",{direction:"sendrecv"});
+   state.call.peers[remoteId].videoSender=tx.sender;
+
+   const currentVideo=state.call.videoStream?.getVideoTracks?.()[0];
+   if(currentVideo){
+     await tx.sender.replaceTrack(currentVideo);
+   }
+ }
+
+ pc.onicecandidate=e=>{
+   if(e.candidate){
+     sendCallSignal(remoteId,"ice",{candidate:e.candidate.toJSON()});
+   }
+ };
+
+ pc.ontrack=e=>{
+   // Do NOT depend on event.streams[0]. Some browsers/mobile WebRTC
+   // implementations deliver a valid track with an empty streams array.
+   const track=e.track;
+
+   if(track && !remoteStream.getTracks().some(t=>t.id===track.id)){
+     remoteStream.addTrack(track);
+   }
+
+   // When the remote side later replaceTrack()s camera/screen sharing,
+   // the same receiver track becomes live automatically.
+   renderCallParticipants();
+
+   track.onunmute=()=>renderCallParticipants();
+   track.onended=()=>renderCallParticipants();
+ };
+
+ pc.onconnectionstatechange=()=>{
+   if(pc.connectionState==="failed"){
+     toast("A call connection failed. Try leaving and rejoining.");
+   }
+   renderCallParticipants();
+ };
+
+ if(makeOffer){
+   const offer=await pc.createOffer();
+   await pc.setLocalDescription(offer);
+   await sendCallSignal(remoteId,"offer",{
+     sdp:pc.localDescription.toJSON()
+   });
+ }
+
  return pc;
 }
+
+function getPeerVideoSender(peer){
+ if(peer?.videoSender)return peer.videoSender;
+
+ const tx=peer?.pc?.getTransceivers?.().find(t=>
+   t.receiver?.track?.kind==="video" ||
+   t.sender?.track?.kind==="video"
+ );
+
+ if(tx){
+   peer.videoSender=tx.sender;
+   return tx.sender;
+ }
+
+ return null;
+}
+
+async function attachCurrentVideoToPeer(peer){
+ if(!peer?.pc)return;
+
+ const track=state.call.videoStream?.getVideoTracks?.()[0]||null;
+ const sender=getPeerVideoSender(peer);
+
+ if(sender){
+   await sender.replaceTrack(track);
+ }
+}
+
+async function renegotiateCallPeer(remoteId){
+ const peer=state.call.peers[remoteId];
+ if(!peer?.pc || peer.pc.signalingState!=="stable")return;
+
+ try{
+   const offer=await peer.pc.createOffer();
+   await peer.pc.setLocalDescription(offer);
+   await sendCallSignal(remoteId,"offer",{
+     sdp:peer.pc.localDescription.toJSON()
+   });
+ }catch(e){}
+}
+
 async function sendCallSignal(uid,type,payload){
  try{await api("/api/calls/signal",{method:"POST",body:JSON.stringify({scope_key:state.call.scopeKey,to_user_id:uid,signal_type:type,payload})})}catch(e){}
 }
@@ -5278,7 +5406,20 @@ async function pollCallSignals(){
    state.call.signalAfter=Math.max(state.call.signalAfter||0,Number(s.id));const uid=Number(s.from_user_id);
    if(!state.call.peers[uid])await createCallPeer(uid,false);const pc=state.call.peers[uid].pc;
    if(s.signal_type==="offer"){
-    await pc.setRemoteDescription(new RTCSessionDescription(s.payload.sdp));const answer=await pc.createAnswer();await pc.setLocalDescription(answer);await sendCallSignal(uid,"answer",{sdp:pc.localDescription.toJSON()});
+    await pc.setRemoteDescription(new RTCSessionDescription(s.payload.sdp));
+
+    const peer=state.call.peers[uid];
+
+    // The incoming offer creates the matching video transceiver on this
+    // side. Store its sender and attach our current video before answering.
+    peer.videoSender=getPeerVideoSender(peer);
+    await attachCurrentVideoToPeer(peer);
+
+    const answer=await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await sendCallSignal(uid,"answer",{
+      sdp:pc.localDescription.toJSON()
+    });
    }else if(s.signal_type==="answer"){
     if(pc.signalingState!=="stable")await pc.setRemoteDescription(new RTCSessionDescription(s.payload.sdp));
    }else if(s.signal_type==="ice"){
@@ -5321,17 +5462,50 @@ function toggleCallMute(){
  state.call.micEnabled=!state.call.micEnabled;tracks.forEach(t=>t.enabled=state.call.micEnabled);updateCallControls();
 }
 async function setOutgoingVideoTrack(track,stream){
- for(const p of Object.values(state.call.peers)){
-  let sender=p.pc.getSenders().find(s=>s.track?.kind==="video");
-  if(sender)await sender.replaceTrack(track||null);else if(track)p.pc.addTrack(track,stream);
+ for(const [remoteId,peer] of Object.entries(state.call.peers)){
+   let sender=getPeerVideoSender(peer);
+
+   if(!sender){
+     // Fallback for an old/already-open peer that was created before this
+     // update or a browser that did not expose the expected transceiver.
+     const tx=peer.pc.addTransceiver("video",{direction:"sendrecv"});
+     peer.videoSender=tx.sender;
+     sender=tx.sender;
+
+     await sender.replaceTrack(track||null);
+     await renegotiateCallPeer(Number(remoteId));
+     continue;
+   }
+
+   await sender.replaceTrack(track||null);
  }
 }
 async function toggleCamera(){
  try{
   if(state.call.sharingScreen){toast("Stop screen sharing before turning on the camera.");return}
   if(state.call.cameraEnabled){state.call.videoStream?.getTracks().forEach(t=>t.stop());await setOutgoingVideoTrack(null,null);state.call.videoStream=null;state.call.cameraEnabled=false;renderCallParticipants();updateCallControls();return}
-  const stream=await navigator.mediaDevices.getUserMedia({audio:false,video:state.call.selectedCamera?{deviceId:{exact:state.call.selectedCamera}}:true});
-  state.call.videoStream=stream;state.call.cameraEnabled=true;const track=stream.getVideoTracks()[0];await setOutgoingVideoTrack(track,stream);track.onended=()=>{if(state.call.cameraEnabled)toggleCamera()};renderCallParticipants();updateCallControls();
+  const stream=await navigator.mediaDevices.getUserMedia({
+   audio:false,
+   video:state.call.selectedCamera?{deviceId:{exact:state.call.selectedCamera}}:true
+  });
+
+  const track=stream.getVideoTracks()[0];
+  if(!track)throw new Error("Camera opened but returned no video track.");
+
+  state.call.videoStream=stream;
+  state.call.cameraEnabled=true;
+  state.call.cameraPermission="granted";
+  state.call.cameraError="";
+
+  await setOutgoingVideoTrack(track,stream);
+
+  track.onended=()=>{
+   if(state.call.cameraEnabled)toggleCamera();
+  };
+
+  renderCallParticipants();
+  updateCallControls();
+  toast("Camera is now being sent to the call.");
  }catch(e){
   if(e?.name==="NotAllowedError"||e?.name==="PermissionDeniedError"){
    state.call.cameraPermission="denied";state.call.cameraError="Camera permission is blocked.";openCallPermissionHelp("camera");
@@ -5343,7 +5517,26 @@ async function toggleScreenShare(){
  try{
   if(state.call.sharingScreen){await stopScreenShare();return}
   if(state.call.cameraEnabled)await toggleCamera();
-  const stream=await navigator.mediaDevices.getDisplayMedia({video:true,audio:false});state.call.videoStream=stream;state.call.sharingScreen=true;const track=stream.getVideoTracks()[0];await setOutgoingVideoTrack(track,stream);track.onended=()=>stopScreenShare();renderCallParticipants();updateCallControls();
+  const stream=await navigator.mediaDevices.getDisplayMedia({
+   video:{
+     frameRate:{ideal:30,max:30}
+   },
+   audio:false
+  });
+
+  const track=stream.getVideoTracks()[0];
+  if(!track)throw new Error("Screen sharing returned no video track.");
+
+  state.call.videoStream=stream;
+  state.call.sharingScreen=true;
+
+  await setOutgoingVideoTrack(track,stream);
+
+  track.onended=()=>stopScreenShare();
+
+  renderCallParticipants();
+  updateCallControls();
+  toast("Your screen is now being shared to the call.");
  }catch(e){if(e?.name!=="NotAllowedError")toast(e.message||"Could not share screen")}
 }
 async function stopScreenShare(){
@@ -5371,7 +5564,16 @@ async function openCallPanel(){
   ${(state.call.micPermission==="denied"||state.call.cameraPermission==="denied")?`<div class="callPermissionWarning"><div><b>Device permission blocked</b><span>${state.call.micPermission==="denied"?"Microphone ":""}${state.call.micPermission==="denied"&&state.call.cameraPermission==="denied"?"and ":""}${state.call.cameraPermission==="denied"?"camera ":""}access is blocked. You can still stay in the call.</span></div><button class="ghost" onclick="openCallPermissionHelp('${state.call.micPermission==="denied"?"microphone":"camera"}')">Fix Permission</button></div>`:""}
   <div class="callControls"><button id="callMuteBtn" class="callControlBtn" onclick="toggleCallMute()"></button><button id="callCameraBtn" class="callControlBtn" onclick="toggleCamera()"></button><button id="callScreenBtn" class="callControlBtn" onclick="toggleScreenShare()"></button></div>
   <div class="grid2 callDeviceGrid"><div><div class="label">Microphone</div><select class="field" onchange="changeCallMic(this)"><option value="">Default microphone</option>${devices.mics.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedMic===d.deviceId?"selected":""}>${esc(d.label||`Microphone ${i+1}`)}</option>`).join("")}</select></div><div><div class="label">Camera</div><select class="field" onchange="changeCallCamera(this)"><option value="">Default camera</option>${devices.cameras.map((d,i)=>`<option value="${esc(d.deviceId)}" ${state.call.selectedCamera===d.deviceId?"selected":""}>${esc(d.label||`Camera ${i+1}`)}</option>`).join("")}</select></div></div>
-  <div class="callHint">Microphone: ${state.call.micPermission==="granted"?"Ready":state.call.micPermission}. Camera permission: ${state.call.cameraPermission==="granted"?"Ready":state.call.cameraPermission}. Screen sharing availability depends on your phone/browser.</div>
+  <div class="callMediaStatus">
+   ${state.call.cameraEnabled
+     ?`<span class="callMediaLive">● Camera sending</span>`
+     :state.call.sharingScreen
+       ?`<span class="callMediaLive">● Screen sharing</span>`
+       :`<span>Video off</span>`
+   }
+   <span>${Object.keys(state.call.peers||{}).length} peer connection${Object.keys(state.call.peers||{}).length===1?"":"s"}</span>
+  </div>
+  <div class="callHint">Microphone: ${state.call.micPermission==="granted"?"Ready":state.call.micPermission}. Camera permission: ${state.call.cameraPermission==="granted"?"Ready":state.call.cameraPermission}. A PC can share its screen to both PC and mobile callers. Sending a screen from a phone depends on whether that phone browser supports screen capture.</div>
  </div>`);renderCallParticipants();updateCallControls();
 }
 function updateCallControls(){
@@ -5387,7 +5589,25 @@ function updateCallControls(){
 function renderCallParticipants(){
  const el=document.getElementById("callParticipants");if(!el)return;const me=Number(state.me.id);const people=[{id:me,username:state.profile.username,avatar:state.profile.avatar,local:true,stream:state.call.videoStream||state.call.localStream}];
  for(const p of state.call.participants||[]){const id=Number(p.id);if(id===me)continue;people.push({...p,local:false,stream:state.call.peers[id]?.stream||null})}
- el.innerHTML=people.map(p=>`<div class="callTile"><div class="callVideoWrap">${p.stream&&p.stream.getVideoTracks().length?`<video id="callVideo-${p.id}" autoplay playsinline ${p.local?"muted":""}></video>`:`<div class="callAvatarFallback"><img src="${avatarSrc(p.avatar)}"><span>${esc(p.username)}</span></div>`}</div><div class="callTileFooter"><span>${esc(p.username)}${p.local?" (You)":""}</span>${p.local&&!state.call.micEnabled?`<span class="pill">Muted</span>`:""}${p.local&&state.call.sharingScreen?`<span class="pill">Sharing</span>`:""}</div></div>`).join("");
+ el.innerHTML=people.map(p=>{
+  const videoTracks=p.stream?.getVideoTracks?.()||[];
+  const hasVideoTrack=videoTracks.length>0;
+
+  return `<div class="callTile ${hasVideoTrack?"hasVideo":""}">
+   <div class="callVideoWrap">
+    ${hasVideoTrack
+      ?`<video id="callVideo-${p.id}" autoplay playsinline ${p.local?"muted":""}></video>`
+      :`<div class="callAvatarFallback"><img src="${avatarSrc(p.avatar)}"><span>${esc(p.username)}</span></div>`
+    }
+   </div>
+   <div class="callTileFooter">
+    <span>${esc(p.username)}${p.local?" (You)":""}</span>
+    ${p.local&&!state.call.micEnabled?`<span class="pill">Muted</span>`:""}
+    ${p.local&&state.call.cameraEnabled?`<span class="pill">Camera</span>`:""}
+    ${p.local&&state.call.sharingScreen?`<span class="pill">Sharing Screen</span>`:""}
+   </div>
+  </div>`;
+ }).join("");
  for(const p of people){if(p.stream&&p.stream.getVideoTracks().length){const v=document.getElementById(`callVideo-${p.id}`);if(v){v.srcObject=p.stream;v.play().catch(()=>{})}}if(!p.local&&p.stream){let a=document.getElementById(`callAudio-${p.id}`);if(!a){a=document.createElement("audio");a.id=`callAudio-${p.id}`;a.autoplay=true;a.style.display="none";document.body.appendChild(a)}a.srcObject=p.stream;a.play().catch(()=>{})}}
 }
 window.addEventListener("beforeunload",()=>{if(state.call.active&&state.call.scopeKey){try{navigator.sendBeacon("/api/calls/leave",new Blob([JSON.stringify({scope_key:state.call.scopeKey})],{type:"application/json"}))}catch(e){}}});
