@@ -3707,6 +3707,108 @@ body.iphone11PreviewMode{
   font-weight:800;
 }
 
+
+/* ============================================================
+   VYNTRA CALL STATUS + INCOMING CALL BANNER
+   ============================================================ */
+.inCallStatusBtn{
+  min-height:36px;
+  padding:0 12px;
+  border-radius:12px;
+  border:1px solid rgba(74,222,128,.24);
+  background:rgba(74,222,128,.09);
+  color:#aaf0bf;
+  display:inline-flex;
+  align-items:center;
+  gap:7px;
+  font-size:11px;
+  font-weight:900;
+  cursor:pointer;
+}
+.inCallStatusDot{
+  width:8px;
+  height:8px;
+  border-radius:50%;
+  background:#4ade80;
+  box-shadow:0 0 10px rgba(74,222,128,.45);
+}
+.incomingCallBanner{
+  position:fixed;
+  left:50%;
+  bottom:18px;
+  transform:translateX(-50%);
+  width:min(620px,calc(100vw - 28px));
+  z-index:99999;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:14px;
+  padding:12px 14px;
+  border-radius:16px;
+  border:1px solid rgba(74,222,128,.28);
+  background:rgba(14,12,18,.97);
+  box-shadow:0 16px 44px rgba(0,0,0,.42);
+  backdrop-filter:blur(14px);
+}
+.incomingCallInfo{
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  gap:3px;
+}
+.incomingCallTitle{
+  color:#f4eef8;
+  font-size:13px;
+  font-weight:900;
+}
+.incomingCallSub{
+  color:#9d93a7;
+  font-size:11px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.incomingCallActions{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex:0 0 auto;
+}
+.incomingJoinBtn{
+  min-height:38px;
+  padding:0 16px;
+  border:0;
+  border-radius:12px;
+  background:#22c55e;
+  color:#06110a;
+  font-size:12px;
+  font-weight:900;
+  cursor:pointer;
+}
+.incomingJoinBtn:hover{
+  background:#2bd468;
+}
+@media(max-width:720px){
+  .inCallStatusBtn{
+    min-height:34px;
+    padding:0 10px;
+    font-size:10px;
+  }
+  .incomingCallBanner{
+    bottom:74px;
+    align-items:stretch;
+    flex-direction:column;
+  }
+  .incomingCallActions{
+    width:100%;
+    display:grid;
+    grid-template-columns:1fr 1fr;
+  }
+  .incomingCallActions button{
+    width:100%;
+  }
+}
+
 </style>
 </head>
 <body>
@@ -3724,7 +3826,7 @@ const state={
  messageLoadSeq:0,typingPoll:null,lastTypingSent:0,typingUsers:[],memberPoll:null,
  pendingImage:null,unreads:{public:{},dms:{},servers:{},server_totals:{},friends_total:0,total:0},
  unreadPoll:null,notificationPermission:"default",lastNotified:{},
- call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:"",micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null}
+ call:{active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:"",selectedCamera:"",micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null,incomingCalls:[],incomingPoll:null,lastIncomingNotified:{}}
 };
 const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
 const avatarSrc=s=>esc(s||"/static/spookchat_pfp.png");
@@ -3795,6 +3897,7 @@ async function boot(){
    setTimeout(checkInviteFromURL,150);
    setTimeout(checkBotInviteFromURL,220);
    setTimeout(startUnreadPolling,300);
+   setTimeout(startIncomingCallPolling,360);
  }catch(e){renderLogin()}
 }
 
@@ -4330,7 +4433,7 @@ function renderApp(){
 
 function renderChat(){
  const title=state.view==="public"?(state.channel==="chat1"?"# Chat 1":"# Chat 2"):"Chat";
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${callButton()}${notificationBellButton()}</div></header>
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(title)}</div><div class="topSub">Public VYNTRA channel</div></div><div class="topActions">${inCallStatusButton()}${callButton()}${notificationBellButton()}</div></header>
  <div class="content"><div id="messageList" class="messages"></div></div>
  ${(!window._siteStatus?.public_channels_locked||state.profile.global_role==="admin"||state.profile.global_role==="owner")?`<div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message ${esc(title)}..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`:`<div class="composer publicReadOnly"><div class="muted" style="padding:10px 12px">This public channel is currently locked. Only VYNTRA Admins and Owner can post.</div></div>`}`;
  appShell.classList.remove("with-members");
@@ -4622,8 +4725,157 @@ function currentCallScopePayload(){
  if(state.view==="dm")return {kind:"dm",chat_id:state.activeChat};
  return null;
 }
+
+function inCallStatusButton(){
+ if(!state.call.active)return "";
+
+ return `<button class="inCallStatusBtn" onclick="openCallPanel()" title="Open current call">
+   <span class="inCallStatusDot"></span>
+   <span>You're in a call</span>
+ </button>`;
+}
+
 function callButton(){
  return `<button class="callTopBtn ${state.call.active?"inCall":""}" onclick="${state.call.active?"openCallPanel()":"openCallSetup()"}" title="${state.call.active?"Open current call":"Start call"}"><span class="callTopIcon">☎</span><span>${state.call.active?"In Call":"Call"}</span></button>`;
+}
+
+
+function incomingCallKey(call){
+ return call.scope_key;
+}
+
+function currentCallScopeKey(){
+ const p=currentCallScopePayload();
+ if(!p)return "";
+
+ if(p.kind==="public")return `public:${p.channel}`;
+ if(p.kind==="server")return `server:${p.server_id}:${p.channel}`;
+ if(p.kind==="dm")return `dm:${p.chat_id}`;
+
+ return "";
+}
+
+async function pollIncomingCalls(){
+ try{
+   const d=await api("/api/calls/active");
+   const calls=d.calls||[];
+
+   state.call.incomingCalls=calls;
+
+   // Ignore the call we're already inside.
+   const currentActive=state.call.active?state.call.scopeKey:"";
+   const candidates=calls.filter(c=>c.scope_key!==currentActive);
+
+   if(!candidates.length){
+     hideIncomingCallBanner();
+     return;
+   }
+
+   // Show the newest active call.
+   const call=candidates[0];
+
+   showIncomingCallBanner(call);
+
+   // If the tab/page is hidden or unfocused, use a system notification.
+   if(
+     (document.visibilityState!=="visible" || !document.hasFocus()) &&
+     "Notification" in window &&
+     Notification.permission==="granted"
+   ){
+     const key=incomingCallKey(call);
+     const last=Number(state.call.lastIncomingNotified?.[key]||0);
+     const now=Date.now();
+
+     // Avoid spamming the same incoming call notification.
+     if(now-last>30000){
+       state.call.lastIncomingNotified[key]=now;
+       showIncomingCallSystemNotification(call);
+     }
+   }
+
+ }catch(e){}
+}
+
+function startIncomingCallPolling(){
+ clearInterval(state.call.incomingPoll);
+ pollIncomingCalls();
+ state.call.incomingPoll=setInterval(pollIncomingCalls,2500);
+}
+
+function showIncomingCallBanner(call){
+ let wrap=document.getElementById("incomingCallBanner");
+
+ if(!wrap){
+   wrap=document.createElement("div");
+   wrap.id="incomingCallBanner";
+   wrap.className="incomingCallBanner";
+   document.body.appendChild(wrap);
+ }
+
+ wrap.innerHTML=`
+   <div class="incomingCallInfo">
+     <div class="incomingCallTitle">Someone is calling you</div>
+     <div class="incomingCallSub">${esc(call.display_name||"VYNTRA call")} · ${call.participant_count||1} in call</div>
+   </div>
+   <div class="incomingCallActions">
+     <button class="ghost" onclick="dismissIncomingCallBanner()">Dismiss</button>
+     <button class="incomingJoinBtn" onclick='joinIncomingCall(${JSON.stringify(call).replace(/'/g,"&#39;")})'>Join Call</button>
+   </div>
+ `;
+}
+
+function hideIncomingCallBanner(){
+ const el=document.getElementById("incomingCallBanner");
+ if(el)el.remove();
+}
+
+function dismissIncomingCallBanner(){
+ hideIncomingCallBanner();
+}
+
+async function joinIncomingCall(call){
+ if(!call)return;
+
+ if(call.kind==="public"){
+   openPublic(call.channel);
+ }else if(call.kind==="server"){
+   await openServer(call.server_id,call.channel);
+ }else if(call.kind==="dm"){
+   await openChat(call.chat_id);
+ }
+
+ hideIncomingCallBanner();
+
+ // Open setup so the user can verify mic/camera before joining.
+ setTimeout(openCallSetup,120);
+}
+
+function showIncomingCallSystemNotification(call){
+ try{
+   const n=new Notification("Incoming VYNTRA call",{
+     body:`${call.display_name||"Someone"} is calling you`,
+     icon:"/static/spookchat_pfp.png",
+     badge:"/static/spookchat_pfp.png",
+     tag:`vyntra-incoming-call-${call.scope_key}`,
+     renotify:true
+   });
+
+   n.onclick=()=>{
+     window.focus();
+
+     if(call.kind==="public"){
+       openPublic(call.channel);
+     }else if(call.kind==="server"){
+       openServer(call.server_id,call.channel);
+     }else if(call.kind==="dm"){
+       openChat(call.chat_id);
+     }
+
+     setTimeout(openCallSetup,150);
+     n.close();
+   };
+
+ }catch(e){}
 }
 
 function callPermissionStatus(kind){
@@ -4963,6 +5215,7 @@ async function startCall(fromSetup=false){
    state.call.scopeKey=d.scope_key;
    state.call.participants=d.participants||[];
    state.call.signalAfter=0;
+   hideIncomingCallBanner();
 
    // The preflight stream is now the real call microphone stream.
    state.call.preflightMicStream=null;
@@ -5041,7 +5294,7 @@ async function leaveCall(){
  clearInterval(state.call.signalPoll);clearInterval(state.call.heartbeatPoll);Object.values(state.call.peers).forEach(p=>{try{p.pc.close()}catch(e){}});
  state.call.localStream?.getTracks().forEach(t=>t.stop());state.call.videoStream?.getTracks().forEach(t=>t.stop());
  const mic=state.call.selectedMic,cam=state.call.selectedCamera;
- state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam,micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null};
+ state.call={active:false,scopeKey:"",participants:[],peers:{},localStream:null,videoStream:null,signalAfter:0,signalPoll:null,heartbeatPoll:null,micEnabled:true,cameraEnabled:false,sharingScreen:false,selectedMic:mic,selectedCamera:cam,micPermission:"unknown",cameraPermission:"unknown",micError:"",cameraError:"",preflightMicStream:null,preflightCameraStream:null,incomingCalls:[],incomingPoll:null,lastIncomingNotified:{}};
  document.querySelectorAll('[id^="callAudio-"]').forEach(e=>e.remove());modalClose();renderApp();toast("Left call");
 }
 async function enableCallMicrophone(){
@@ -5758,7 +6011,7 @@ async function renderDM(id){
  root.innerHTML=`<div id="appShell" class="app">${sidebar()}<main class="main"><div id="mainArea" style="height:100%;display:flex;flex-direction:column"></div></main><aside id="membersPane" class="membersPane"></aside></div>${mobilebar()}`;
  let info=await api("/api/chats/"+id);
  await markChatNotificationsRead(id);
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${callButton()}${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(info.chat.display_name)}</div><div class="topSub">${info.chat.kind==="group"?"Group chat":"Direct message"}</div></div><div class="topActions">${inCallStatusButton()}${callButton()}${notificationBellButton()}</div></header><div class="content"><div id="messageList" class="messages"></div></div><div class="composer">${photoComposerControls()}<input id="messageInput" maxlength="4000" placeholder="Message..." onkeydown="if(event.key==='Enter'){event.preventDefault();sendMessage()}"><button class="primary" onclick="sendMessage()">Send</button></div>`;
  loadMessages(true);attachTypingListener();renderPhotoPreview();state.poll=setInterval(loadMessages,2000);
 }
 function groupCreate(){modalOpen("Create group chat",`<form class="formGrid" onsubmit="makeGroup(event)"><div class="label">Group name</div><input id="groupName" class="field" maxlength="50" required><div class="label">Add usernames</div><input id="groupUsers" class="field" placeholder="alex, sam, jordan"><div class="modalActions"><button type="button" class="ghost" onclick="modalClose()">Cancel</button><button class="primary">Create</button></div></form>`)}
@@ -6008,7 +6261,7 @@ function renderServer(){
  clearInterval(state.poll);
  const s=state.serverInfo; if(!s){openPublic("chat1");return}
  if(window.innerWidth>1000)appShell.classList.add("with-members");else appShell.classList.remove("with-members");
- mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions serverDesktopActions">${callButton()}${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div><button class="roundBtn serverMobileMenu" onclick="showMobileServerActions()">•••</button></header>
+ mainArea.innerHTML=`<header class="topbar"><div><div class="topTitle">${esc(s.name)}</div><div class="topSub">${s.member_count} member${s.member_count===1?"":"s"}</div></div><div class="topActions serverDesktopActions">${inCallStatusButton()}${callButton()}${notificationBellButton()}${hasServerPerm("invite_members")?`<button class="ghost" onclick="showServerInvite(${s.id})">🔗 Invite</button>`:""}${hasServerPerm("manage_server")||s.my_role==="owner"?`<button class="ghost" onclick="showServerSettings(${s.id})">⚙ Settings</button>`:""}<button class="ghost" onclick="toggleMembers()">👥 Members</button></div><button class="roundBtn serverMobileMenu" onclick="showMobileServerActions()">•••</button></header>
  <div class="mobileServerQuickBar">
    <button class="mobileCallQuick" onclick="${state.call.active?"openCallPanel()":"startCall()"}">${state.call.active?"Open Call":"Call"}</button>
    <button onclick="showMobileMembers()">Members</button>
@@ -10123,6 +10376,129 @@ def typing_update():
 
 
 
+
+
+@app.get("/api/calls/active")
+@login_required
+def active_calls_for_user():
+    uid=request.me["id"]
+
+    with connect() as c:
+        # Clean stale call participants/signals first.
+        c.execute("""
+            delete from call_participants
+            where last_seen < now()-interval '20 seconds'
+        """)
+        c.execute("""
+            delete from call_signals
+            where created_at < now()-interval '2 minutes'
+        """)
+
+        rows=c.execute("""
+            select distinct cp.scope_key,
+                   min(cp.joined_at) as started_at,
+                   count(*) as participant_count
+            from call_participants cp
+            where cp.user_id<>%s
+              and cp.last_seen >= now()-interval '20 seconds'
+            group by cp.scope_key
+            order by started_at desc
+            limit 50
+        """,(uid,)).fetchall()
+
+        c.commit()
+
+    out=[]
+
+    for scope,started_at,participant_count in rows:
+        parts=str(scope).split(":")
+
+        try:
+            if parts[0]=="public" and len(parts)>=2:
+                channel=":".join(parts[1:])
+
+                if not verify_call_access("public",uid,channel,None,None):
+                    continue
+
+                out.append({
+                    "scope_key":scope,
+                    "kind":"public",
+                    "channel":channel,
+                    "server_id":None,
+                    "chat_id":None,
+                    "display_name":channel.replace("chat1","Chat 1").replace("chat2","Chat 2"),
+                    "participant_count":int(participant_count),
+                    "started_at":started_at
+                })
+
+            elif parts[0]=="server" and len(parts)==3:
+                sid=int(parts[1])
+                cid=int(parts[2])
+
+                if not verify_call_access("server",uid,cid,sid,None):
+                    continue
+
+                with connect() as c:
+                    row=c.execute("""
+                        select s.name,sc.name
+                        from servers s
+                        join server_channels sc on sc.server_id=s.id
+                        where s.id=%s and sc.id=%s
+                    """,(sid,cid)).fetchone()
+
+                if not row:
+                    continue
+
+                out.append({
+                    "scope_key":scope,
+                    "kind":"server",
+                    "channel":cid,
+                    "server_id":sid,
+                    "chat_id":None,
+                    "display_name":f"{row[0]} · #{row[1]}",
+                    "participant_count":int(participant_count),
+                    "started_at":started_at
+                })
+
+            elif parts[0]=="dm" and len(parts)==2:
+                cid=int(parts[1])
+
+                if not verify_call_access("dm",uid,None,None,cid):
+                    continue
+
+                with connect() as c:
+                    row=c.execute("""
+                        select kind,name
+                        from chats
+                        where id=%s
+                    """,(cid,)).fetchone()
+
+                    names=c.execute("""
+                        select u.username
+                        from chat_members cm
+                        join users u on u.id=cm.user_id
+                        where cm.chat_id=%s and cm.user_id<>%s
+                        order by u.username
+                        limit 5
+                    """,(cid,uid)).fetchall()
+
+                display=(row[1] if row and row[1] else None) or ", ".join(r[0] for r in names) or "Direct Message"
+
+                out.append({
+                    "scope_key":scope,
+                    "kind":"dm",
+                    "channel":None,
+                    "server_id":None,
+                    "chat_id":cid,
+                    "display_name":display,
+                    "participant_count":int(participant_count),
+                    "started_at":started_at
+                })
+
+        except Exception:
+            continue
+
+    return jsonify(calls=out)
 
 @app.post("/api/calls/join")
 @login_required
