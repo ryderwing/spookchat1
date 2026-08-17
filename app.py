@@ -5194,11 +5194,7 @@ async function viewProfile(uid){
           ${
             p.friend_status==="friends"
               ?`<button class="ghost" disabled>Friends</button>`
-              :p.friend_status==="pending_sent"
-                ?`<button class="ghost" disabled>Friend Request Sent</button>`
-                :p.friend_status==="pending_received"
-                  ?`<button class="primary" onclick="showFriendsPage();modalClose()">Respond to Request</button>`
-                  :`<button class="primary" onclick="addFriend(${uid});modalClose()">Add Friend</button>`
+              :`<button class="primary" onclick="addFriend(${uid});modalClose()">Add Friend</button>`
           }
           <button class="ghost" onclick="startDM(${uid});modalClose()">Message</button>
         </div>`
@@ -7554,27 +7550,18 @@ def profile_get(uid):
     profile["friend_status"]="self" if uid==request.me["id"] else "none"
 
     if uid!=request.me["id"]:
+        a,b=sorted([int(request.me["id"]),int(uid)])
+
         with connect() as c:
-            # Support either ordering in the friendship row.
             fr=c.execute("""
-                select status,user_id,friend_id
-                from friendships
-                where (user_id=%s and friend_id=%s)
-                   or (user_id=%s and friend_id=%s)
+                select status
+                from friends
+                where user_a=%s and user_b=%s
                 limit 1
-            """,(request.me["id"],uid,uid,request.me["id"])).fetchone()
+            """,(a,b)).fetchone()
 
-        if fr:
-            status=str(fr[0] or "").lower()
-
-            if status in ("accepted","friends","friend"):
-                profile["friend_status"]="friends"
-            elif status in ("pending","requested"):
-                # Distinguish sent vs received if possible.
-                if int(fr[1])==int(request.me["id"]):
-                    profile["friend_status"]="pending_sent"
-                else:
-                    profile["friend_status"]="pending_received"
+        if fr and str(fr[0] or "").lower()=="accepted":
+            profile["friend_status"]="friends"
 
     return jsonify(profile=profile)
 
